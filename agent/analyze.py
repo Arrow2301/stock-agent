@@ -24,6 +24,26 @@ import pandas as pd
 import numpy as np
 from supabase import create_client, Client
 
+import math
+
+def clean_value(v):
+    if isinstance(v, (np.floating, float)):
+        if math.isnan(float(v)) or math.isinf(float(v)):
+            return None
+        return float(v)
+    if isinstance(v, (np.integer, int)):
+        return int(v)
+    if isinstance(v, (np.bool_, bool)):
+        return bool(v)
+    if isinstance(v, dict):
+        return {k: clean_value(val) for k, val in v.items()}
+    if isinstance(v, list):
+        return [clean_value(x) for x in v]
+    return v
+
+def clean_record(d):
+    return {k: clean_value(v) for k, v in d.items()}
+  
 warnings.filterwarnings("ignore")
 
 # ─────────────────────────────────────────────
@@ -388,29 +408,30 @@ def run():
         agg      = lambda key: round(float(np.mean([bt[n][key] for n in active])), 2) if active else 0
         low_samp = int(np.mean([bt[n]["trades"] for n in active])) < 5 if active else True
 
-        records.append(dict(
-            date               = today,
-            ticker             = ticker,
-            action             = action,
-            raw_score          = buy_count if action=="BUY" else sell_count,
-            weighted_score_val = w_ratio,
-            composite_score    = c_score,
-            score_label        = score_label(c_score),
-            score_breakdown    = json.dumps(c_breakdown),
-            signals            = json.dumps(today_sigs),
-            strategy_weights   = json.dumps(weights),
-            backtest           = json.dumps(bt),
-            active_strategies  = ", ".join(active),
-            low_sample_warning = low_samp,
-            win_rate           = agg("win_rate"),
-            avg_return         = agg("avg_return"),
-            median_return      = agg("median_return"),
-            profit_factor      = agg("profit_factor"),
-            max_drawdown       = agg("max_drawdown"),
-            avg_trades         = int(np.mean([bt[n]["trades"] for n in active])) if active else 0,
-            market_regime      = regime_label,
-            **ctx,
-        ))
+            rec = dict(
+        date               = today,
+        ticker             = ticker,
+        action             = action,
+        raw_score          = buy_count if action=="BUY" else sell_count,
+        weighted_score_val = w_ratio,
+        composite_score    = c_score,
+        score_label        = score_label(c_score),
+        score_breakdown    = c_breakdown,
+        signals            = today_sigs,
+        strategy_weights   = weights,
+        backtest           = bt,
+        active_strategies  = ", ".join(active),
+        low_sample_warning = low_samp,
+        win_rate           = agg("win_rate"),
+        avg_return         = agg("avg_return"),
+        median_return      = agg("median_return"),
+        profit_factor      = agg("profit_factor"),
+        max_drawdown       = agg("max_drawdown"),
+        avg_trades         = int(np.mean([bt[n]["trades"] for n in active])) if active else 0,
+        market_regime      = regime_label,
+        **ctx,
+    )
+    records.append(clean_record(rec))
         time.sleep(0.1)
 
     sys.stdout.write("\r" + " "*60 + "\r")
@@ -421,15 +442,17 @@ def run():
             supabase.table("recommendations").insert(records[i:i+20]).execute()
 
     for i in range(0, len(run_logs), 50):
-        supabase.table("ticker_run_log").insert(run_logs[i:i+50]).execute()
+        chunk = [clean_record(x) for x in run_logs[i:i+50]] supabase.table("ticker_run_log").insert(chunk).execute()
 
-    supabase.table("agent_meta").upsert({
-        "id": 1, "last_run": today,
-        "total_signals": len(records),
-        "tickers_scanned": len(ALL_TICKERS),
-        "failed": sum(1 for l in run_logs if l["status"]!="ok"),
-        "market_regime": regime_label,
-    }).execute()
+    meta_row = clean_record({
+    "id": 1,
+    "last_run": today,
+    "total_signals": len(records),
+    "tickers_scanned": len(ALL_TICKERS),
+    "failed": sum(1 for l in run_logs if l["status"] != "ok"),
+    "market_regime": regime_label,
+})
+supabase.table("agent_meta").upsert(meta_row).execute()
 
     print("  Done ✅\n")
 
