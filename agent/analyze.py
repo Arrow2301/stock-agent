@@ -100,8 +100,8 @@ BB_STD          = 2.0
 ATR_PERIOD      = 14
 SUPERTREND_MULT = 3.0
 HOLD_DAYS       = 10          # backtest holding period
-MIN_BUY_SCORE   = 2           # minimum strategies agreeing
-MIN_SELL_SCORE  = 2
+MIN_BUY_SCORE   = 1           # minimum strategies agreeing
+MIN_SELL_SCORE  = 1
 
 # ─────────────────────────────────────────────
 #  INDICATORS
