@@ -408,7 +408,7 @@ def run():
         agg      = lambda key: round(float(np.mean([bt[n][key] for n in active])), 2) if active else 0
         low_samp = int(np.mean([bt[n]["trades"] for n in active])) < 5 if active else True
 
-            rec = dict(
+    rec = dict(
         date               = today,
         ticker             = ticker,
         action             = action,
