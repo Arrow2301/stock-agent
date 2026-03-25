@@ -400,7 +400,7 @@ def run():
         if w_ratio < MIN_WEIGHTED_SCORE:
             continue
 
-        ctx = context(df)
+                ctx = context(df)
         c_score, c_breakdown = composite_score(today_sigs, bt, ctx, regime_sc, action)
 
         active   = [n for n,v in today_sigs.items()
@@ -408,30 +408,30 @@ def run():
         agg      = lambda key: round(float(np.mean([bt[n][key] for n in active])), 2) if active else 0
         low_samp = int(np.mean([bt[n]["trades"] for n in active])) < 5 if active else True
 
-    rec = dict(
-        date               = today,
-        ticker             = ticker,
-        action             = action,
-        raw_score          = buy_count if action=="BUY" else sell_count,
-        weighted_score_val = w_ratio,
-        composite_score    = c_score,
-        score_label        = score_label(c_score),
-        score_breakdown    = c_breakdown,
-        signals            = today_sigs,
-        strategy_weights   = weights,
-        backtest           = bt,
-        active_strategies  = ", ".join(active),
-        low_sample_warning = low_samp,
-        win_rate           = agg("win_rate"),
-        avg_return         = agg("avg_return"),
-        median_return      = agg("median_return"),
-        profit_factor      = agg("profit_factor"),
-        max_drawdown       = agg("max_drawdown"),
-        avg_trades         = int(np.mean([bt[n]["trades"] for n in active])) if active else 0,
-        market_regime      = regime_label,
-        **ctx,
-    )
-    records.append(clean_record(rec))
+        rec = dict(
+            date               = today,
+            ticker             = ticker,
+            action             = action,
+            raw_score          = buy_count if action=="BUY" else sell_count,
+            weighted_score_val = w_ratio,
+            composite_score    = c_score,
+            score_label        = score_label(c_score),
+            score_breakdown    = c_breakdown,
+            signals            = today_sigs,
+            strategy_weights   = weights,
+            backtest           = bt,
+            active_strategies  = ", ".join(active),
+            low_sample_warning = low_samp,
+            win_rate           = agg("win_rate"),
+            avg_return         = agg("avg_return"),
+            median_return      = agg("median_return"),
+            profit_factor      = agg("profit_factor"),
+            max_drawdown       = agg("max_drawdown"),
+            avg_trades         = int(np.mean([bt[n]["trades"] for n in active])) if active else 0,
+            market_regime      = regime_label,
+            **ctx,
+        )
+        records.append(clean_record(rec))
         time.sleep(0.1)
 
     sys.stdout.write("\r" + " "*60 + "\r")
@@ -442,17 +442,18 @@ def run():
             supabase.table("recommendations").insert(records[i:i+20]).execute()
 
     for i in range(0, len(run_logs), 50):
-        chunk = [clean_record(x) for x in run_logs[i:i+50]] supabase.table("ticker_run_log").insert(chunk).execute()
+        chunk = [clean_record(x) for x in run_logs[i:i+50]]
+        supabase.table("ticker_run_log").insert(chunk).execute()
 
     meta_row = clean_record({
-    "id": 1,
-    "last_run": today,
-    "total_signals": len(records),
-    "tickers_scanned": len(ALL_TICKERS),
-    "failed": sum(1 for l in run_logs if l["status"] != "ok"),
-    "market_regime": regime_label,
-})
-supabase.table("agent_meta").upsert(meta_row).execute()
+        "id": 1,
+        "last_run": today,
+        "total_signals": len(records),
+        "tickers_scanned": len(ALL_TICKERS),
+        "failed": sum(1 for l in run_logs if l["status"] != "ok"),
+        "market_regime": regime_label,
+    })
+    supabase.table("agent_meta").upsert(meta_row).execute()
 
     print("  Done ✅\n")
 
