@@ -495,6 +495,7 @@ def run():
             date=today,
             ticker=ticker,
             action=action,
+            score=buy_count if action == "BUY" else sell_count,
             raw_score=buy_count if action == "BUY" else sell_count,
             weighted_score_val=w_ratio,
             composite_score=c_score,
