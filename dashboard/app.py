@@ -786,9 +786,10 @@ elif page == "📅 Signal History":
 # ─────────────────────────────────────────────
 elif page == "📈 Strategy Stats":
     st.title("📈 Strategy Performance Stats")
+    st.caption("Historical strategy stats can mix old and new live strategy sets. Use the filter below to focus on current live strategies.")
 
     res = sb.table("recommendations").select(
-        "ticker,backtest,action,win_rate,avg_return,composite_score,profit_factor,max_drawdown,median_return"
+        "ticker,backtest,action,win_rate,avg_return,composite_score,profit_factor,max_drawdown,median_return,date,param_version"
     ).execute()
     all_recs = pd.DataFrame(res.data) if res.data else pd.DataFrame()
 
@@ -796,11 +797,32 @@ elif page == "📈 Strategy Stats":
         st.info("No data yet.")
         st.stop()
 
+    current_live_strategies = [
+        "EMA Crossover",
+        "RSI + MACD",
+        "Bollinger",
+    ]
+
+    f1, f2 = st.columns(2)
+    strategy_mode = f1.selectbox(
+        "Strategy view",
+        ["Current live strategies only", "All historical strategies"],
+        index=0
+    )
+    days_back = f2.slider("History window (days)", 7, 180, 60)
+
+    if "date" in all_recs.columns:
+        cutoff = (date.today() - timedelta(days=days_back)).isoformat()
+        all_recs = all_recs[all_recs["date"] >= cutoff].copy()
+
     rows = []
     for _, r in all_recs.iterrows():
         try:
             bt = json.loads(r.backtest) if isinstance(r.backtest, str) else r.backtest
             for name, stats in bt.items():
+                if strategy_mode == "Current live strategies only" and name not in current_live_strategies:
+                    continue
+
                 rows.append({
                     "Strategy": name,
                     "Win Rate": stats.get("win_rate", 0),
@@ -816,7 +838,7 @@ elif page == "📈 Strategy Stats":
             continue
 
     if not rows:
-        st.info("No backtest data yet.")
+        st.info("No backtest data yet for the selected filter.")
         st.stop()
 
     bt_df = pd.DataFrame(rows)
@@ -831,6 +853,11 @@ elif page == "📈 Strategy Stats":
         Target_Exits=("Target Exits", "sum"),
     ).reset_index()
 
+    if strategy_mode == "Current live strategies only":
+        st.success("Showing only the current live strategy basket: EMA Crossover, RSI + MACD, Bollinger.")
+    else:
+        st.warning("Showing all historical strategies. Results may include old strategies from previous agent versions.")
+
     for _, row in agg.iterrows():
         if row.Total_Trades < 20:
             st.warning(f"⚠️ **{row.Strategy}**: only {int(row.Total_Trades)} trades — interpret cautiously.")
@@ -839,27 +866,40 @@ elif page == "📈 Strategy Stats":
 
     with c1:
         fig = px.bar(
-            agg, x="Strategy", y="Win_Rate", color="Win_Rate",
-            color_continuous_scale="teal", text="Win_Rate", title="Win Rate %"
+            agg,
+            x="Strategy",
+            y="Win_Rate",
+            color="Win_Rate",
+            color_continuous_scale="teal",
+            text="Win_Rate",
+            title="Win Rate %"
         )
         fig.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
         fig.update_layout(
-            height=300, showlegend=False,
-            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)"
+            height=300,
+            showlegend=False,
+            plot_bgcolor="rgba(0,0,0,0)",
+            paper_bgcolor="rgba(0,0,0,0)"
         )
         st.plotly_chart(fig, use_container_width=True)
 
     with c2:
         fig2 = px.bar(
-            agg, x="Strategy", y="Profit_Factor", color="Profit_Factor",
-            color_continuous_scale="RdYlGn", text="Profit_Factor",
+            agg,
+            x="Strategy",
+            y="Profit_Factor",
+            color="Profit_Factor",
+            color_continuous_scale="RdYlGn",
+            text="Profit_Factor",
             title="Profit Factor (>1 = profitable)"
         )
         fig2.add_hline(y=1.0, line_dash="dash", line_color="#ef5350")
         fig2.update_traces(texttemplate="%{text:.2f}", textposition="outside")
         fig2.update_layout(
-            height=300, showlegend=False,
-            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)"
+            height=300,
+            showlegend=False,
+            plot_bgcolor="rgba(0,0,0,0)",
+            paper_bgcolor="rgba(0,0,0,0)"
         )
         st.plotly_chart(fig2, use_container_width=True)
 
@@ -893,7 +933,10 @@ elif page == "📈 Strategy Stats":
 
             if not merged.empty:
                 fig_sc = px.scatter(
-                    merged, x="composite_score", y="pnl_pct", color="pnl_pct",
+                    merged,
+                    x="composite_score",
+                    y="pnl_pct",
+                    color="pnl_pct",
                     color_continuous_scale="RdYlGn",
                     hover_data=["ticker", "score_label", "exit_reason"],
                     title="Composite Score vs Realised P&L %"
