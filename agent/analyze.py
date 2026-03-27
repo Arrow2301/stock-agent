@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
 ============================================================
-  Indian Stock Market Analysis Agent  —  v3
+  Indian Stock Market Analysis Agent  —  v4
   Runs daily via GitHub Actions at 7:00 AM IST
 
-  Key change from v2:
-  ─ All strategy parameters are loaded from Supabase
-    `agent_params` table (champion row) at startup
-  ─ Falls back to safe defaults if no champion exists yet
-  ─ Logs which param version was used in agent_meta
+  v4 changes:
+  ─ Adds 3 new strategies:
+      • Donchian Breakout
+      • Volume Breakout
+      • RSI Trend Shift
+  ─ Removes Supertrend from voting/backtest strategies
+  ─ Keeps Supertrend only in context display
 ============================================================
 """
 
@@ -68,7 +70,7 @@ EXTRA_WATCHLIST = []
 ALL_TICKERS = NIFTY50 + EXTRA_WATCHLIST
 
 # ─────────────────────────────────────────────
-#  DEFAULT PARAMETERS  (used until first champion)
+#  DEFAULT PARAMETERS
 # ─────────────────────────────────────────────
 DEFAULT_PARAMS = {
     "EMA_SHORT":          9,
@@ -76,18 +78,20 @@ DEFAULT_PARAMS = {
     "RSI_PERIOD":         14,
     "RSI_OVERSOLD":       42,
     "RSI_OVERBOUGHT":     62,
+    "RSI_MIDLINE":        50,
     "MACD_FAST":          12,
     "MACD_SLOW":          26,
     "MACD_SIGNAL":        9,
     "BB_PERIOD":          20,
     "BB_STD":             2.0,
+    "DONCHIAN_PERIOD":    20,
+    "VOLUME_MULT":        1.5,
     "ATR_PERIOD":         14,
     "SUPERTREND_MULT":    3.0,
     "BT_SL_PCT":          5.0,
     "BT_TARGET_PCT":      10.0,
     "BT_MAX_HOLD":        15,
     "MIN_WEIGHTED_SCORE": 0.28,
-    # Composite score weights (must sum to 100)
     "W_STRATEGY":         40,
     "W_RSI":              20,
     "W_VOLUME":           15,
@@ -96,21 +100,15 @@ DEFAULT_PARAMS = {
 }
 
 # ─────────────────────────────────────────────
-#  LOAD ACTIVE PARAMS FROM SUPABASE
+#  LOAD ACTIVE PARAMS
 # ─────────────────────────────────────────────
-
 def load_active_params() -> tuple[dict, str]:
-    """
-    Returns (params_dict, version_label).
-    Loads the current 'champion' row from agent_params.
-    Falls back to DEFAULT_PARAMS if none exists.
-    """
     try:
-        res = supabase.table("agent_params")\
-            .select("*")\
-            .eq("status", "champion")\
-            .order("promoted_at", desc=True)\
-            .limit(1)\
+        res = supabase.table("agent_params") \
+            .select("*") \
+            .eq("status", "champion") \
+            .order("promoted_at", desc=True) \
+            .limit(1) \
             .execute()
         if res.data:
             row = res.data[0]
@@ -118,13 +116,12 @@ def load_active_params() -> tuple[dict, str]:
             merged = {**DEFAULT_PARAMS, **params}
             return merged, f"v{row['version']} (score={row['objective_score']:.3f})"
     except Exception as e:
-        print(f"  ⚠️  Could not load champion params: {e}")
+        print(f"  ⚠️ Could not load champion params: {e}")
     return DEFAULT_PARAMS.copy(), "defaults"
 
 # ─────────────────────────────────────────────
 #  INDICATORS
 # ─────────────────────────────────────────────
-
 def ema(s, p):
     return s.ewm(span=p, adjust=False).mean()
 
@@ -171,7 +168,6 @@ def supertrend(h, l, c, p, mult):
 # ─────────────────────────────────────────────
 #  SIGNAL GENERATORS
 # ─────────────────────────────────────────────
-
 def sig_ema(df, p):
     e_s = ema(df.Close, p["EMA_SHORT"])
     e_l = ema(df.Close, p["EMA_LONG"])
@@ -196,25 +192,75 @@ def sig_bb(df, p):
     s[(df.High >= up) & (df.Close < up) & (r > 50)] = -1
     return s
 
-def sig_supertrend(df, p):
-    trend, _ = supertrend(df.High, df.Low, df.Close, p["ATR_PERIOD"], p["SUPERTREND_MULT"])
+def sig_donchian(df, p):
+    period = int(p.get("DONCHIAN_PERIOD", 20))
+    hh = df.High.rolling(period).max()
+    ll = df.Low.rolling(period).min()
     s = pd.Series(0, index=df.index)
-    s[(trend == 1) & (trend.shift() == -1)] = 1
-    s[(trend == -1) & (trend.shift() == 1)] = -1
+    s[(df.Close > hh.shift(1)) & (df.Close.shift(1) <= hh.shift(1))] = 1
+    s[(df.Close < ll.shift(1)) & (df.Close.shift(1) >= ll.shift(1))] = -1
+    return s
+
+def sig_volume_breakout(df, p):
+    period = int(p.get("DONCHIAN_PERIOD", 20))
+    vol_mult = float(p.get("VOLUME_MULT", 1.5))
+    hh = df.High.rolling(period).max()
+    ll = df.Low.rolling(period).min()
+    avg_vol = df.Volume.rolling(20).mean()
+
+    s = pd.Series(0, index=df.index)
+
+    buy_cond = (
+        (df.Close > hh.shift(1)) &
+        (df.Close.shift(1) <= hh.shift(1)) &
+        (df.Volume > avg_vol * vol_mult)
+    )
+
+    sell_cond = (
+        (df.Close < ll.shift(1)) &
+        (df.Close.shift(1) >= ll.shift(1)) &
+        (df.Volume > avg_vol * vol_mult)
+    )
+
+    s[buy_cond] = 1
+    s[sell_cond] = -1
+    return s
+
+def sig_rsi_trend_shift(df, p):
+    r = rsi(df.Close, p["RSI_PERIOD"])
+    e_l = ema(df.Close, p["EMA_LONG"])
+    mid = float(p.get("RSI_MIDLINE", 50))
+    s = pd.Series(0, index=df.index)
+
+    buy_cond = (
+        (df.Close > e_l) &
+        (r > mid) &
+        (r.shift(1) <= mid)
+    )
+
+    sell_cond = (
+        (df.Close < e_l) &
+        (r < mid) &
+        (r.shift(1) >= mid)
+    )
+
+    s[buy_cond] = 1
+    s[sell_cond] = -1
     return s
 
 def get_strategies(p):
     return {
-        "EMA Crossover": lambda df: sig_ema(df, p),
-        "RSI + MACD":    lambda df: sig_rsi_macd(df, p),
-        "Bollinger":     lambda df: sig_bb(df, p),
-        "Supertrend":    lambda df: sig_supertrend(df, p),
+        "EMA Crossover":     lambda df: sig_ema(df, p),
+        "RSI + MACD":        lambda df: sig_rsi_macd(df, p),
+        "Bollinger":         lambda df: sig_bb(df, p),
+        "Donchian Breakout": lambda df: sig_donchian(df, p),
+        "Volume Breakout":   lambda df: sig_volume_breakout(df, p),
+        "RSI Trend Shift":   lambda df: sig_rsi_trend_shift(df, p),
     }
 
 # ─────────────────────────────────────────────
 #  BACKTEST
 # ─────────────────────────────────────────────
-
 def backtest(df, signals, p):
     trades, reasons = [], []
     in_t, ep, entry_idx = False, 0.0, -1
@@ -272,7 +318,6 @@ def backtest(df, signals, p):
 # ─────────────────────────────────────────────
 #  JSON SANITIZER
 # ─────────────────────────────────────────────
-
 def sanitize_for_json(obj):
     if isinstance(obj, dict):
         return {k: sanitize_for_json(v) for k, v in obj.items()}
@@ -291,7 +336,6 @@ def sanitize_for_json(obj):
 # ─────────────────────────────────────────────
 #  WEIGHTED VOTE + COMPOSITE SCORE
 # ─────────────────────────────────────────────
-
 def weighted_vote(today_sigs, bt_results, action):
     weights = {}
     for name, bt in bt_results.items():
@@ -352,7 +396,6 @@ def score_label(s):
 # ─────────────────────────────────────────────
 #  DATA & CONTEXT
 # ─────────────────────────────────────────────
-
 def fetch(ticker, days=430):
     try:
         df = yf.download(
@@ -445,16 +488,15 @@ def market_regime(p):
         if price < e20 < e50 and r < 50:
             return "BEARISH", 0.0
         return "NEUTRAL", 0.5
-    except:
+    except Exception:
         return "UNKNOWN", 0.5
 
 # ─────────────────────────────────────────────
 #  MAIN
 # ─────────────────────────────────────────────
-
 def run():
     today = datetime.today().strftime("%Y-%m-%d")
-    print(f"\n🇮🇳 Indian Stock Agent v3 — {today}")
+    print(f"\n🇮🇳 Indian Stock Agent v4 — {today}")
 
     P, param_version = load_active_params()
     print(f"   Params: {param_version}")
@@ -500,23 +542,18 @@ def run():
                 n for n, v in today_sigs.items()
                 if (v == 1 and action == "BUY") or (v == -1 and action == "SELL")
             ]
+
             agg = lambda k: round(float(np.mean([bt[n][k] for n in active])), 2) if active else 0
             low_smp = int(np.mean([bt[n]["trades"] for n in active])) < 5 if active else True
 
-            
             record = dict(
                 date=today,
                 ticker=ticker,
                 action=action,
-            
-                # legacy DB column: integer only
                 score=int(round(c_score)) if c_score is not None else 0,
-            
-                # new schema columns
                 raw_score=int(buy_count if action == "BUY" else sell_count),
                 weighted_score_val=float(w_ratio) if w_ratio is not None else 0.0,
                 composite_score=float(c_score) if c_score is not None else 0.0,
-            
                 score_label=score_label(c_score if c_score is not None else 0),
                 score_breakdown=json.dumps(sanitize_for_json(c_breakdown)),
                 signals=json.dumps(sanitize_for_json(today_sigs)),
@@ -524,14 +561,12 @@ def run():
                 backtest=json.dumps(sanitize_for_json(bt)),
                 active_strategies=", ".join(active),
                 low_sample_warning=bool(low_smp),
-            
                 win_rate=float(agg("win_rate")) if active else 0.0,
                 avg_return=float(agg("avg_return")) if active else 0.0,
                 median_return=float(agg("median_return")) if active else 0.0,
                 profit_factor=float(agg("profit_factor")) if active else 0.0,
                 max_drawdown=float(agg("max_drawdown")) if active else 0.0,
                 avg_trades=int(round(np.mean([bt[n]["trades"] for n in active]))) if active else 0,
-            
                 market_regime=regime_label,
                 param_version=param_version,
                 **ctx,
