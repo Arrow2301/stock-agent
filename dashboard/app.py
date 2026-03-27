@@ -1071,4 +1071,3 @@ st.caption(
     "⚠️ Paper trading & educational purposes only. Not financial advice. "
     "Past backtest results do not guarantee future performance."
 )
-```
