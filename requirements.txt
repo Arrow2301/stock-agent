@@ -4,3 +4,4 @@ numpy>=1.24.0
 supabase>=2.3.0
 streamlit>=1.32.0
 plotly>=5.18.0
+optuna>=3.6.0
