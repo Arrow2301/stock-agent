@@ -1,0 +1,39 @@
+name: Weekly Parameter Optimization
+
+on:
+  # Runs every Sunday at 17:30 UTC = 11:00 PM IST
+  # (markets closed, fresh week of data available)
+  schedule:
+    - cron: "30 17 * * 0"
+
+  # Manual trigger from GitHub UI
+  workflow_dispatch:
+    inputs:
+      n_trials:
+        description: "Number of Optuna trials (default 200)"
+        required: false
+        default: "200"
+
+jobs:
+  optimize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90      # optimization can take up to 60-75 min
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run optimizer
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python agent/optimize.py
