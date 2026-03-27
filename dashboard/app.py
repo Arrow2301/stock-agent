@@ -697,12 +697,15 @@ elif page == "🤖 Optimizer":
         sel_v=st.selectbox("Select candidate version",cand_versions)
         mc1,mc2=st.columns(2)
         if mc1.button("⚔️ Set as Challenger"):
-            supabase.table("agent_params").update({"status":"retired"}).eq("status","challenger").execute()
-            promote_param(int(sel_v),"challenger")
-            st.success(f"v{sel_v} is now Challenger."); st.rerun()
-        if mc2.button("👑 Promote directly to Champion"):
-            promote_param(int(sel_v),"champion")
-            st.success(f"v{sel_v} is now Champion."); st.rerun()
+            sb.table("agent_params").update({"status": "retired"}).eq("status", "challenger").execute()
+            promote_param(int(sel_v), "challenger")
+            st.success(f"v{sel_v} is now Challenger.")
+            st.rerun()
+          if mc2.button("👑 Promote directly to Champion"):
+              promote_param(int(sel_v), "champion")
+              st.success(f"v{sel_v} is now Champion.")
+              st.rerun()  
+    
 
     st.divider()
 
