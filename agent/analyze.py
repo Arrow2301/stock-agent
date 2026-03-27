@@ -503,10 +503,20 @@ def run():
             agg = lambda k: round(float(np.mean([bt[n][k] for n in active])), 2) if active else 0
             low_smp = int(np.mean([bt[n]["trades"] for n in active])) < 5 if active else True
 
+            
             record = dict(
-                date=today, ticker=ticker, action=action,
+                date=today,
+                ticker=ticker,
+                action=action,
+            
+                # keep old schema column
+                score=float(c_score),
+            
+                # keep new columns
                 raw_score=buy_count if action == "BUY" else sell_count,
-                weighted_score_val=w_ratio, composite_score=c_score,
+                weighted_score_val=w_ratio,
+                composite_score=float(c_score),
+            
                 score_label=score_label(c_score),
                 score_breakdown=json.dumps(sanitize_for_json(c_breakdown)),
                 signals=json.dumps(sanitize_for_json(today_sigs)),
@@ -514,12 +524,14 @@ def run():
                 backtest=json.dumps(sanitize_for_json(bt)),
                 active_strategies=", ".join(active),
                 low_sample_warning=low_smp,
+            
                 win_rate=agg("win_rate"),
                 avg_return=agg("avg_return"),
                 median_return=agg("median_return"),
                 profit_factor=agg("profit_factor"),
                 max_drawdown=agg("max_drawdown"),
                 avg_trades=int(np.mean([bt[n]["trades"] for n in active])) if active else 0,
+            
                 market_regime=regime_label,
                 param_version=param_version,
                 **ctx,
