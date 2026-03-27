@@ -509,28 +509,28 @@ def run():
                 ticker=ticker,
                 action=action,
             
-                # keep old schema column
-                score=float(c_score),
+                # legacy DB column: integer only
+                score=int(round(c_score)) if c_score is not None else 0,
             
-                # keep new columns
-                raw_score=buy_count if action == "BUY" else sell_count,
-                weighted_score_val=w_ratio,
-                composite_score=float(c_score),
+                # new schema columns
+                raw_score=int(buy_count if action == "BUY" else sell_count),
+                weighted_score_val=float(w_ratio) if w_ratio is not None else 0.0,
+                composite_score=float(c_score) if c_score is not None else 0.0,
             
-                score_label=score_label(c_score),
+                score_label=score_label(c_score if c_score is not None else 0),
                 score_breakdown=json.dumps(sanitize_for_json(c_breakdown)),
                 signals=json.dumps(sanitize_for_json(today_sigs)),
                 strategy_weights=json.dumps(sanitize_for_json(weights)),
                 backtest=json.dumps(sanitize_for_json(bt)),
                 active_strategies=", ".join(active),
-                low_sample_warning=low_smp,
+                low_sample_warning=bool(low_smp),
             
-                win_rate=agg("win_rate"),
-                avg_return=agg("avg_return"),
-                median_return=agg("median_return"),
-                profit_factor=agg("profit_factor"),
-                max_drawdown=agg("max_drawdown"),
-                avg_trades=int(np.mean([bt[n]["trades"] for n in active])) if active else 0,
+                win_rate=float(agg("win_rate")) if active else 0.0,
+                avg_return=float(agg("avg_return")) if active else 0.0,
+                median_return=float(agg("median_return")) if active else 0.0,
+                profit_factor=float(agg("profit_factor")) if active else 0.0,
+                max_drawdown=float(agg("max_drawdown")) if active else 0.0,
+                avg_trades=int(round(np.mean([bt[n]["trades"] for n in active]))) if active else 0,
             
                 market_regime=regime_label,
                 param_version=param_version,
