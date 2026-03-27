@@ -1,7 +1,7 @@
 -- ============================================================
 --  Run this in Supabase SQL Editor
 --  Fresh install: run everything
---  Upgrading from v1: uncomment and run the ALTER TABLE block
+--  Upgrading from v2: uncomment and run the ALTER TABLE block
 -- ============================================================
 
 -- 1. RECOMMENDATIONS
@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS recommendations (
     max_drawdown        FLOAT,
     avg_trades          INT,
     market_regime       TEXT,
+    param_version       TEXT,
     price               FLOAT,
     change_1d           FLOAT,
     change_5d           FLOAT,
@@ -82,47 +83,88 @@ CREATE INDEX IF NOT EXISTS idx_runlog_date ON ticker_run_log (date DESC);
 
 -- 4. AGENT META
 CREATE TABLE IF NOT EXISTS agent_meta (
-    id               INT PRIMARY KEY DEFAULT 1,
-    last_run         DATE,
-    total_signals    INT     DEFAULT 0,
-    tickers_scanned  INT     DEFAULT 0,
-    failed           INT     DEFAULT 0,
-    market_regime    TEXT,
-    updated_at       TIMESTAMPTZ DEFAULT NOW()
+    id                   INT PRIMARY KEY DEFAULT 1,
+    last_run             DATE,
+    total_signals        INT DEFAULT 0,
+    tickers_scanned      INT DEFAULT 0,
+    failed               INT DEFAULT 0,
+    market_regime        TEXT,
+    active_param_version TEXT,
+    updated_at           TIMESTAMPTZ DEFAULT NOW()
 );
 INSERT INTO agent_meta (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
 
--- DISABLE RLS (personal project)
-ALTER TABLE recommendations DISABLE ROW LEVEL SECURITY;
-ALTER TABLE paper_portfolio DISABLE ROW LEVEL SECURITY;
-ALTER TABLE ticker_run_log  DISABLE ROW LEVEL SECURITY;
-ALTER TABLE agent_meta      DISABLE ROW LEVEL SECURITY;
+-- 5. AGENT PARAMS  (optimizer output — champion/challenger/candidates)
+CREATE TABLE IF NOT EXISTS agent_params (
+    id               BIGSERIAL PRIMARY KEY,
+    version          INT          NOT NULL UNIQUE,
+    status           TEXT         NOT NULL DEFAULT 'candidate',
+    params_json      JSONB        NOT NULL,
+    objective_score  FLOAT,
+    profit_factor    FLOAT,
+    win_rate         FLOAT,
+    avg_return       FLOAT,
+    max_drawdown     FLOAT,
+    total_trades     INT,
+    train_start      DATE,
+    train_end        DATE,
+    valid_start      DATE,
+    valid_end        DATE,
+    run_date         DATE,
+    promoted_at      DATE,
+    rank             INT,
+    notes            TEXT,
+    created_at       TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_params_status  ON agent_params (status);
+CREATE INDEX IF NOT EXISTS idx_params_version ON agent_params (version DESC);
 
--- ── UPGRADING FROM v1? Uncomment and run this block instead ──
-/*
-ALTER TABLE recommendations
-    ADD COLUMN IF NOT EXISTS raw_score          INT,
-    ADD COLUMN IF NOT EXISTS weighted_score_val FLOAT,
-    ADD COLUMN IF NOT EXISTS composite_score    FLOAT,
-    ADD COLUMN IF NOT EXISTS score_label        TEXT,
-    ADD COLUMN IF NOT EXISTS score_breakdown    JSONB,
-    ADD COLUMN IF NOT EXISTS strategy_weights   JSONB,
-    ADD COLUMN IF NOT EXISTS low_sample_warning BOOLEAN DEFAULT FALSE,
-    ADD COLUMN IF NOT EXISTS median_return      FLOAT,
-    ADD COLUMN IF NOT EXISTS profit_factor      FLOAT,
-    ADD COLUMN IF NOT EXISTS max_drawdown       FLOAT,
-    ADD COLUMN IF NOT EXISTS avg_trades         INT,
-    ADD COLUMN IF NOT EXISTS market_regime      TEXT,
-    ADD COLUMN IF NOT EXISTS supertrend_line    FLOAT;
-ALTER TABLE paper_portfolio
-    ADD COLUMN IF NOT EXISTS entry_stop_loss   FLOAT,
-    ADD COLUMN IF NOT EXISTS entry_target      FLOAT,
-    ADD COLUMN IF NOT EXISTS exit_reason       TEXT,
-    ADD COLUMN IF NOT EXISTS recommendation_id BIGINT;
-CREATE TABLE IF NOT EXISTS ticker_run_log (
-    id BIGSERIAL PRIMARY KEY, date DATE NOT NULL,
-    ticker TEXT NOT NULL, status TEXT NOT NULL,
+-- 6. OPTIMIZATION RUN LOG
+CREATE TABLE IF NOT EXISTS optimization_runs (
+    id                  BIGSERIAL PRIMARY KEY,
+    run_date            DATE NOT NULL,
+    n_trials            INT,
+    n_valid_trials      INT,
+    best_score          FLOAT,
+    best_profit_factor  FLOAT,
+    best_win_rate       FLOAT,
+    best_avg_return     FLOAT,
+    champion_version    INT,
+    challenger_version  INT,
+    stocks_used         INT,
+    created_at          TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- DISABLE RLS (personal project)
+ALTER TABLE recommendations   DISABLE ROW LEVEL SECURITY;
+ALTER TABLE paper_portfolio   DISABLE ROW LEVEL SECURITY;
+ALTER TABLE ticker_run_log    DISABLE ROW LEVEL SECURITY;
+ALTER TABLE agent_meta        DISABLE ROW LEVEL SECURITY;
+ALTER TABLE agent_params      DISABLE ROW LEVEL SECURITY;
+ALTER TABLE optimization_runs DISABLE ROW LEVEL SECURITY;
+
+-- ── UPGRADING FROM v2? Run only this block ──────────────────
+
+ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS param_version TEXT;
+ALTER TABLE agent_meta      ADD COLUMN IF NOT EXISTS active_param_version TEXT;
+
+CREATE TABLE IF NOT EXISTS agent_params (
+    id BIGSERIAL PRIMARY KEY, version INT NOT NULL UNIQUE,
+    status TEXT NOT NULL DEFAULT 'candidate', params_json JSONB NOT NULL,
+    objective_score FLOAT, profit_factor FLOAT, win_rate FLOAT,
+    avg_return FLOAT, max_drawdown FLOAT, total_trades INT,
+    train_start DATE, train_end DATE, valid_start DATE, valid_end DATE,
+    run_date DATE, promoted_at DATE, rank INT, notes TEXT,
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
-ALTER TABLE agent_meta ADD COLUMN IF NOT EXISTS market_regime TEXT;
-*/
+ALTER TABLE agent_params DISABLE ROW LEVEL SECURITY;
+
+CREATE TABLE IF NOT EXISTS optimization_runs (
+    id BIGSERIAL PRIMARY KEY, run_date DATE NOT NULL,
+    n_trials INT, n_valid_trials INT, best_score FLOAT,
+    best_profit_factor FLOAT, best_win_rate FLOAT, best_avg_return FLOAT,
+    champion_version INT, challenger_version INT, stocks_used INT,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+ALTER TABLE optimization_runs DISABLE ROW LEVEL SECURITY;
+
