@@ -4,13 +4,14 @@
   Indian Stock Market Analysis Agent  —  v4
   Runs daily via GitHub Actions at 7:00 AM IST
 
-  v4 changes:
-  ─ Adds 3 new strategies:
-      • Donchian Breakout
-      • Volume Breakout
-      • RSI Trend Shift
-  ─ Removes Supertrend from voting/backtest strategies
-  ─ Keeps Supertrend only in context display
+  v4 live setup:
+  ─ Uses only 3 live strategies:
+      • EMA Crossover
+      • RSI + MACD
+      • Bollinger
+  ─ Lowers MIN_WEIGHTED_SCORE so single-strategy signals
+    like Bollinger can survive more often
+  ─ Keeps Supertrend only for context display
 ============================================================
 """
 
@@ -85,13 +86,13 @@ DEFAULT_PARAMS = {
     "BB_PERIOD":          20,
     "BB_STD":             2.0,
     "DONCHIAN_PERIOD":    20,
-    "VOLUME_MULT":        1.5,
+    "VOLUME_MULT":        1.2,
     "ATR_PERIOD":         14,
     "SUPERTREND_MULT":    3.0,
     "BT_SL_PCT":          5.0,
     "BT_TARGET_PCT":      10.0,
     "BT_MAX_HOLD":        15,
-    "MIN_WEIGHTED_SCORE": 0.28,
+    "MIN_WEIGHTED_SCORE": 0.15,
     "W_STRATEGY":         40,
     "W_RSI":              20,
     "W_VOLUME":           15,
@@ -104,12 +105,14 @@ DEFAULT_PARAMS = {
 # ─────────────────────────────────────────────
 def load_active_params() -> tuple[dict, str]:
     try:
-        res = supabase.table("agent_params") \
-            .select("*") \
-            .eq("status", "champion") \
-            .order("promoted_at", desc=True) \
-            .limit(1) \
+        res = (
+            supabase.table("agent_params")
+            .select("*")
+            .eq("status", "champion")
+            .order("promoted_at", desc=True)
+            .limit(1)
             .execute()
+        )
         if res.data:
             row = res.data[0]
             params = json.loads(row["params_json"]) if isinstance(row["params_json"], str) else row["params_json"]
@@ -127,8 +130,8 @@ def ema(s, p):
 
 def rsi(s, p=14):
     d = s.diff()
-    ag = d.clip(lower=0).ewm(alpha=1/p, min_periods=p, adjust=False).mean()
-    al = (-d.clip(upper=0)).ewm(alpha=1/p, min_periods=p, adjust=False).mean()
+    ag = d.clip(lower=0).ewm(alpha=1 / p, min_periods=p, adjust=False).mean()
+    al = (-d.clip(upper=0)).ewm(alpha=1 / p, min_periods=p, adjust=False).mean()
     return 100 - (100 / (1 + ag / al.replace(0, np.nan)))
 
 def macd(s, fast, slow, sig):
@@ -143,7 +146,7 @@ def bollinger(s, p, std):
 
 def atr(h, l, c, p):
     tr = pd.concat([(h - l), (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
-    return tr.ewm(alpha=1/p, min_periods=p, adjust=False).mean()
+    return tr.ewm(alpha=1 / p, min_periods=p, adjust=False).mean()
 
 def supertrend(h, l, c, p, mult):
     atr_v = atr(h, l, c, p)
@@ -154,14 +157,14 @@ def supertrend(h, l, c, p, mult):
     fu, fl = up.copy(), dn.copy()
 
     for i in range(1, len(c)):
-        fu.iloc[i] = up.iloc[i] if (up.iloc[i] < fu.iloc[i-1] or c.iloc[i-1] > fu.iloc[i-1]) else fu.iloc[i-1]
-        fl.iloc[i] = dn.iloc[i] if (dn.iloc[i] > fl.iloc[i-1] or c.iloc[i-1] < fl.iloc[i-1]) else fl.iloc[i-1]
-        if trend.iloc[i-1] == -1 and c.iloc[i] > fu.iloc[i]:
+        fu.iloc[i] = up.iloc[i] if (up.iloc[i] < fu.iloc[i - 1] or c.iloc[i - 1] > fu.iloc[i - 1]) else fu.iloc[i - 1]
+        fl.iloc[i] = dn.iloc[i] if (dn.iloc[i] > fl.iloc[i - 1] or c.iloc[i - 1] < fl.iloc[i - 1]) else fl.iloc[i - 1]
+        if trend.iloc[i - 1] == -1 and c.iloc[i] > fu.iloc[i]:
             trend.iloc[i] = 1
-        elif trend.iloc[i-1] == 1 and c.iloc[i] < fl.iloc[i]:
+        elif trend.iloc[i - 1] == 1 and c.iloc[i] < fl.iloc[i]:
             trend.iloc[i] = -1
         else:
-            trend.iloc[i] = trend.iloc[i-1]
+            trend.iloc[i] = trend.iloc[i - 1]
 
     return trend, pd.Series(np.where(trend == 1, fl, fu), index=c.index)
 
@@ -207,7 +210,6 @@ def sig_volume_breakout(df, p):
     hh = df.High.rolling(period).max()
     ll = df.Low.rolling(period).min()
     avg_vol = df.Volume.rolling(20).mean()
-
     s = pd.Series(0, index=df.index)
 
     buy_cond = (
@@ -215,7 +217,6 @@ def sig_volume_breakout(df, p):
         (df.Close.shift(1) <= hh.shift(1)) &
         (df.Volume > avg_vol * vol_mult)
     )
-
     sell_cond = (
         (df.Close < ll.shift(1)) &
         (df.Close.shift(1) >= ll.shift(1)) &
@@ -237,7 +238,6 @@ def sig_rsi_trend_shift(df, p):
         (r > mid) &
         (r.shift(1) <= mid)
     )
-
     sell_cond = (
         (df.Close < e_l) &
         (r < mid) &
@@ -250,12 +250,9 @@ def sig_rsi_trend_shift(df, p):
 
 def get_strategies(p):
     return {
-        "EMA Crossover":     lambda df: sig_ema(df, p),
-        "RSI + MACD":        lambda df: sig_rsi_macd(df, p),
-        "Bollinger":         lambda df: sig_bb(df, p),
-        "Donchian Breakout": lambda df: sig_donchian(df, p),
-        "Volume Breakout":   lambda df: sig_volume_breakout(df, p),
-        "RSI Trend Shift":   lambda df: sig_rsi_trend_shift(df, p),
+        "EMA Crossover": lambda df: sig_ema(df, p),
+        "RSI + MACD":    lambda df: sig_rsi_macd(df, p),
+        "Bollinger":     lambda df: sig_bb(df, p),
     }
 
 # ─────────────────────────────────────────────
@@ -526,12 +523,14 @@ def run():
             today_sigs = {name: int(fn(df).iloc[-1]) for name, fn in STRATEGIES.items()}
             buy_count = sum(1 for v in today_sigs.values() if v == 1)
             sell_count = sum(1 for v in today_sigs.values() if v == -1)
+
             if buy_count == 0 and sell_count == 0:
                 continue
 
             bt = {name: backtest(df, fn(df), P) for name, fn in STRATEGIES.items()}
             action = "BUY" if buy_count >= sell_count else "SELL"
             w_ratio, weights = weighted_vote(today_sigs, bt, action)
+
             if w_ratio < P["MIN_WEIGHTED_SCORE"]:
                 continue
 
@@ -586,10 +585,10 @@ def run():
 
     if records:
         for i in range(0, len(records), 20):
-            supabase.table("recommendations").insert(records[i:i+20]).execute()
+            supabase.table("recommendations").insert(records[i:i + 20]).execute()
 
     for i in range(0, len(run_logs), 50):
-        supabase.table("ticker_run_log").insert(run_logs[i:i+50]).execute()
+        supabase.table("ticker_run_log").insert(run_logs[i:i + 50]).execute()
 
     supabase.table("agent_meta").upsert(sanitize_for_json({
         "id": 1,
