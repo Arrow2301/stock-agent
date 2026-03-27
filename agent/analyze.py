@@ -274,25 +274,37 @@ def fetch(ticker, days=430):
     except Exception as e: return None,str(e)[:120]
 
 def context(df, p):
-    c=df.Close; r=float(rsi(c,p["RSI_PERIOD"]).iloc[-1])
-    _,_,hist=macd(c,p["MACD_FAST"],p["MACD_SLOW"],p["MACD_SIGNAL"])
-    e_s=float(ema(c,p["EMA_SHORT"]).iloc[-1]); e_l=float(ema(c,p["EMA_LONG"]).iloc[-1])
-    trend,st_line=supertrend(df.High,df.Low,c,p["ATR_PERIOD"],p["SUPERTREND_MULT"])
-    price=float(c.iloc[-1]); atr_now=float(atr(df.High,df.Low,c,p["ATR_PERIOD"]).iloc[-1])
-    sl=round(price-1.5*atr_now,2); tgt=round(price+3.0*atr_now,2)
-    return dict(price=round(price,2),
-                change_1d=round((c.iloc[-1]-c.iloc[-2])/c.iloc[-2]*100,2),
-                change_5d=round((c.iloc[-1]-c.iloc[-6])/c.iloc[-6]*100,2),
-                rsi=round(r,1), macd_hist=round(float(hist.iloc[-1]),3),
-                ema_bullish=bool(e_s>e_l), supertrend_up=bool(trend.iloc[-1]==1),
-                supertrend_line=round(float(st_line.iloc[-1]),2),
-                support=round(float(df.Low.rolling(20).min().iloc[-1]),2),
-                resistance=round(float(df.High.rolling(20).max().iloc[-1]),2),
-                stop_loss=sl, target=tgt,
-                risk_pct=round((price-sl)/price*100,2),
-                reward_pct=round((tgt-price)/price*100,2),
-                volume=int(df.Volume.iloc[-1]),
-                avg_volume=int(df.Volume.rolling(20).mean().iloc[-1]))
+    c = df.Close
+    r = float(rsi(c, p["RSI_PERIOD"]).iloc[-1])
+    _, _, hist = macd(c, p["MACD_FAST"], p["MACD_SLOW"], p["MACD_SIGNAL"])
+    e_s = float(ema(c, p["EMA_SHORT"]).iloc[-1])
+    e_l = float(ema(c, p["EMA_LONG"]).iloc[-1])
+    trend, st_line = supertrend(df.High, df.Low, c, p["ATR_PERIOD"], p["SUPERTREND_MULT"])
+    price = float(c.iloc[-1])
+    atr_now = float(atr(df.High, df.Low, c, p["ATR_PERIOD"]).iloc[-1])
+
+    sl = round(price - 1.5 * atr_now, 2) if math.isfinite(price) and math.isfinite(atr_now) else None
+    tgt = round(price + 3.0 * atr_now, 2) if math.isfinite(price) and math.isfinite(atr_now) else None
+
+    out = dict(
+        price=round(price, 2) if math.isfinite(price) else None,
+        change_1d=round((c.iloc[-1] - c.iloc[-2]) / c.iloc[-2] * 100, 2) if c.iloc[-2] not in [0, None] else None,
+        change_5d=round((c.iloc[-1] - c.iloc[-6]) / c.iloc[-6] * 100, 2) if c.iloc[-6] not in [0, None] else None,
+        rsi=round(r, 1) if math.isfinite(r) else None,
+        macd_hist=round(float(hist.iloc[-1]), 3) if math.isfinite(float(hist.iloc[-1])) else None,
+        ema_bullish=bool(e_s > e_l) if math.isfinite(e_s) and math.isfinite(e_l) else None,
+        supertrend_up=bool(trend.iloc[-1] == 1) if pd.notna(trend.iloc[-1]) else None,
+        supertrend_line=round(float(st_line.iloc[-1]), 2) if math.isfinite(float(st_line.iloc[-1])) else None,
+        support=round(float(df.Low.rolling(20).min().iloc[-1]), 2) if pd.notna(df.Low.rolling(20).min().iloc[-1]) else None,
+        resistance=round(float(df.High.rolling(20).max().iloc[-1]), 2) if pd.notna(df.High.rolling(20).max().iloc[-1]) else None,
+        stop_loss=sl,
+        target=tgt,
+        risk_pct=round((price - sl) / price * 100, 2) if sl is not None and price not in [0, None] else None,
+        reward_pct=round((tgt - price) / price * 100, 2) if tgt is not None and price not in [0, None] else None,
+        volume=int(df.Volume.iloc[-1]) if pd.notna(df.Volume.iloc[-1]) else 0,
+        avg_volume=int(df.Volume.rolling(20).mean().iloc[-1]) if pd.notna(df.Volume.rolling(20).mean().iloc[-1]) else 0,
+    )
+    return sanitize_for_json(out)
 
 def market_regime(p):
     try:
@@ -306,6 +318,21 @@ def market_regime(p):
         return "NEUTRAL",0.5
     except: return "UNKNOWN",0.5
 
+
+def sanitize_for_json(obj):
+    if isinstance(obj, dict):
+        return {k: sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [sanitize_for_json(v) for v in obj]
+    if isinstance(obj, tuple):
+        return [sanitize_for_json(v) for v in obj]
+    if isinstance(obj, np.generic):
+        obj = obj.item()
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+        return obj
+    return obj
 # ─────────────────────────────────────────────
 #  MAIN
 # ─────────────────────────────────────────────
@@ -335,7 +362,7 @@ def run():
         sys.stdout.flush()
 
         df, status = fetch(ticker)
-        run_logs.append(dict(date=today, ticker=ticker, status=status))
+        run_logs.append(sanitize_for_json(dict(date=today, ticker=ticker, status=status)))
         if df is None: continue
 
         today_sigs = {name: int(fn(df).iloc[-1]) for name, fn in STRATEGIES.items()}
@@ -355,16 +382,15 @@ def run():
                    if (v==1 and action=="BUY") or (v==-1 and action=="SELL")]
         agg     = lambda k: round(float(np.mean([bt[n][k] for n in active])),2) if active else 0
         low_smp = int(np.mean([bt[n]["trades"] for n in active])) < 5 if active else True
-
-        records.append(dict(
+        record = dict(
             date=today, ticker=ticker, action=action,
             raw_score=buy_count if action=="BUY" else sell_count,
             weighted_score_val=w_ratio, composite_score=c_score,
             score_label=score_label(c_score),
-            score_breakdown=json.dumps(c_breakdown),
-            signals=json.dumps(today_sigs),
-            strategy_weights=json.dumps(weights),
-            backtest=json.dumps(bt),
+            score_breakdown=json.dumps(sanitize_for_json(c_breakdown)),
+            signals=json.dumps(sanitize_for_json(today_sigs)),
+            strategy_weights=json.dumps(sanitize_for_json(weights)),
+            backtest=json.dumps(sanitize_for_json(bt)),
             active_strategies=", ".join(active),
             low_sample_warning=low_smp,
             win_rate=agg("win_rate"), avg_return=agg("avg_return"),
@@ -374,7 +400,9 @@ def run():
             market_regime=regime_label,
             param_version=param_version,
             **ctx,
-        ))
+        )
+        records.append(sanitize_for_json(record))
+        
         time.sleep(0.1)
 
     sys.stdout.write("\r" + " "*60 + "\r")
@@ -387,14 +415,14 @@ def run():
     for i in range(0, len(run_logs), 50):
         supabase.table("ticker_run_log").insert(run_logs[i:i+50]).execute()
 
-    supabase.table("agent_meta").upsert({
+    supabase.table("agent_meta").upsert(sanitize_for_json({
         "id":1, "last_run":today,
         "total_signals":len(records),
         "tickers_scanned":len(ALL_TICKERS),
         "failed":sum(1 for l in run_logs if l["status"]!="ok"),
         "market_regime":regime_label,
         "active_param_version":param_version,
-    }).execute()
+    })).execute()
     print("  Done ✅\n")
 
 
