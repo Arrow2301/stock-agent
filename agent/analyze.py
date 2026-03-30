@@ -292,7 +292,8 @@ def backtest(df, signals, p):
     if not trades:
         return dict(
             win_rate=0, avg_return=0, median_return=0, trades=0,
-            profit_factor=0, max_drawdown=0, sl_exits=0, target_exits=0, timeout_exits=0
+            profit_factor=0, max_drawdown=0, sl_exits=0, target_exits=0, timeout_exits=0,
+            trade_returns=[]
         )
 
     wins = [t for t in trades if t > 0]
@@ -313,7 +314,9 @@ def backtest(df, signals, p):
         sl_exits=reasons.count("sl"),
         target_exits=reasons.count("target"),
         timeout_exits=reasons.count("timeout"),
+        trade_returns=[round(float(t), 2) for t in trades],
     )
+
 
 # ─────────────────────────────────────────────
 #  JSON SANITIZER
