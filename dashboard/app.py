@@ -1,3 +1,4 @@
+```python
 """
 ============================================================
   Indian Stock Agent — Dashboard v4
@@ -802,12 +803,21 @@ elif page == "📈 Strategy Stats":
         "RSI + MACD",
         "Bollinger",
     ]
+    known_historical_strategies = [
+        "EMA Crossover",
+        "RSI + MACD",
+        "Bollinger",
+        "Donchian",
+        "Volume Breakout",
+        "RSI Trend Shift",
+    ]
 
     f1, f2 = st.columns(2)
     strategy_mode = f1.selectbox(
         "Strategy view",
-        ["Current live strategies only", "All historical strategies"],
-        index=0
+        ["All historical strategies", "Current live strategies only"],
+        index=0,
+        help="The previous default hid non-live strategies. Use 'All historical strategies' to see the full basket."
     )
     days_back = f2.slider("History window (days)", 7, 180, 60)
 
@@ -816,12 +826,18 @@ elif page == "📈 Strategy Stats":
         all_recs = all_recs[all_recs["date"] >= cutoff].copy()
 
     rows = []
+    observed_strategies = set()
     for _, r in all_recs.iterrows():
         try:
             bt = json.loads(r.backtest) if isinstance(r.backtest, str) else r.backtest
+            if not isinstance(bt, dict):
+                continue
             for name, stats in bt.items():
+                observed_strategies.add(name)
                 if strategy_mode == "Current live strategies only" and name not in current_live_strategies:
                     continue
+                if not isinstance(stats, dict):
+                    stats = {}
 
                 rows.append({
                     "Strategy": name,
@@ -837,36 +853,64 @@ elif page == "📈 Strategy Stats":
         except Exception:
             continue
 
-    if not rows:
-        st.info("No backtest data yet for the selected filter.")
-        st.stop()
+    expected_strategies = (
+        current_live_strategies
+        if strategy_mode == "Current live strategies only"
+        else list(dict.fromkeys(known_historical_strategies + sorted(observed_strategies - set(known_historical_strategies))))
+    )
 
-    bt_df = pd.DataFrame(rows)
-    agg = bt_df.groupby("Strategy").agg(
-        Win_Rate=("Win Rate", "mean"),
-        Avg_Return=("Avg Return", "mean"),
-        Median_Return=("Median Return", "mean"),
-        Profit_Factor=("Profit Factor", "mean"),
-        Max_Drawdown=("Max Drawdown", "mean"),
-        Total_Trades=("Trades", "sum"),
-        SL_Exits=("SL Exits", "sum"),
-        Target_Exits=("Target Exits", "sum"),
-    ).reset_index()
+    if not rows:
+        agg = pd.DataFrame({
+            "Strategy": expected_strategies,
+            "Win_Rate": np.nan,
+            "Avg_Return": np.nan,
+            "Median_Return": np.nan,
+            "Profit_Factor": np.nan,
+            "Max_Drawdown": np.nan,
+            "Total_Trades": 0,
+            "SL_Exits": 0,
+            "Target_Exits": 0,
+        })
+    else:
+        bt_df = pd.DataFrame(rows)
+        agg = bt_df.groupby("Strategy").agg(
+            Win_Rate=("Win Rate", "mean"),
+            Avg_Return=("Avg Return", "mean"),
+            Median_Return=("Median Return", "mean"),
+            Profit_Factor=("Profit Factor", "mean"),
+            Max_Drawdown=("Max Drawdown", "mean"),
+            Total_Trades=("Trades", "sum"),
+            SL_Exits=("SL Exits", "sum"),
+            Target_Exits=("Target Exits", "sum"),
+        ).reset_index()
+
+        agg = (
+            pd.DataFrame({"Strategy": expected_strategies})
+            .merge(agg, on="Strategy", how="left")
+        )
+        count_cols = ["Total_Trades", "SL_Exits", "Target_Exits"]
+        agg[count_cols] = agg[count_cols].fillna(0).astype(int)
 
     if strategy_mode == "Current live strategies only":
         st.success("Showing only the current live strategy basket: EMA Crossover, RSI + MACD, Bollinger.")
     else:
         st.warning("Showing all historical strategies. Results may include old strategies from previous agent versions.")
 
+    missing = agg[agg["Total_Trades"] == 0]["Strategy"].tolist()
+    if missing:
+        st.info("Included with no samples in the selected window: " + ", ".join(missing))
+
     for _, row in agg.iterrows():
-        if row.Total_Trades < 20:
+        if 0 < row.Total_Trades < 20:
             st.warning(f"⚠️ **{row.Strategy}**: only {int(row.Total_Trades)} trades — interpret cautiously.")
 
     c1, c2 = st.columns(2)
 
     with c1:
+        win_plot = agg.copy()
+        win_plot["Win_Rate"] = win_plot["Win_Rate"].fillna(0)
         fig = px.bar(
-            agg,
+            win_plot,
             x="Strategy",
             y="Win_Rate",
             color="Win_Rate",
@@ -884,8 +928,10 @@ elif page == "📈 Strategy Stats":
         st.plotly_chart(fig, use_container_width=True)
 
     with c2:
+        pf_plot = agg.copy()
+        pf_plot["Profit_Factor"] = pf_plot["Profit_Factor"].fillna(0)
         fig2 = px.bar(
-            agg,
+            pf_plot,
             x="Strategy",
             y="Profit_Factor",
             color="Profit_Factor",
@@ -1183,3 +1229,4 @@ st.caption(
     "⚠️ Paper trading & educational purposes only. Not financial advice. "
     "Past backtest results do not guarantee future performance."
 )
+```
