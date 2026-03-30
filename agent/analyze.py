@@ -586,21 +586,39 @@ def run():
     print(f"  ✅ {len(records)} signals  |  ❌ {sum(1 for l in run_logs if l['status'] != 'ok')} failed\n")
 
     if records:
+        print(f"  Saving {len(records)} recommendations to Supabase...")
+        saved = 0
         for i in range(0, len(records), 20):
-            supabase.table("recommendations").insert(records[i:i + 20]).execute()
+            batch = records[i:i + 20]
+            try:
+                supabase.table("recommendations").insert(batch).execute()
+                saved += len(batch)
+            except Exception as e:
+                print(f"  INSERT ERROR batch {i//20 + 1}: {e}")
+                print(f"  First record keys: {list(batch[0].keys())}")
+        print(f"  Saved {saved}/{len(records)} recommendations")
+    else:
+        print(f"  No signals met threshold (MIN_WEIGHTED_SCORE={P['MIN_WEIGHTED_SCORE']})")
+        print(f"  Scanned {len(ALL_TICKERS)} tickers, 0 passed filter")
 
-    for i in range(0, len(run_logs), 50):
-        supabase.table("ticker_run_log").insert(run_logs[i:i + 50]).execute()
+    try:
+        for i in range(0, len(run_logs), 50):
+            supabase.table("ticker_run_log").insert(run_logs[i:i + 50]).execute()
+    except Exception as e:
+        print(f"  Run log insert failed: {e}")
 
-    supabase.table("agent_meta").upsert(sanitize_for_json({
-        "id": 1,
-        "last_run": today,
-        "total_signals": len(records),
-        "tickers_scanned": len(ALL_TICKERS),
-        "failed": sum(1 for l in run_logs if l["status"] != "ok"),
-        "market_regime": regime_label,
-        "active_param_version": param_version,
-    })).execute()
+    try:
+        supabase.table("agent_meta").upsert(sanitize_for_json({
+            "id": 1,
+            "last_run": today,
+            "total_signals": len(records),
+            "tickers_scanned": len(ALL_TICKERS),
+            "failed": sum(1 for l in run_logs if l["status"] != "ok"),
+            "market_regime": regime_label,
+            "active_param_version": param_version,
+        })).execute()
+    except Exception as e:
+        print(f"  Meta upsert failed: {e}")
 
     print("  Done ✅\n")
 
