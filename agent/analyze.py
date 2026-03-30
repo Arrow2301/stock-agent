@@ -55,7 +55,7 @@ NIFTY50 = [
     "ITC", "INDIANB", "INDHOTEL", "IOC", "IRCTC", "IRFC", "IREDA", "IGL",
     "INDUSTOWER", "INDUSINDBK", "NAUKRI", "INFY", "INDIGO", "JSWENERGY", "JSWSTEEL", "JINDALSTEL",
     "JIOFIN", "JUBLFOOD", "KEI", "KPITTECH", "KALYANKJIL", "KOTAKBANK", "LTF", "LICHSGFIN",
-    "LTM", "LT", "LICI", "LODHA", "LUPIN", "MRF", "M&MFIN", "M&M",
+    "LTIM", "LT", "LICI", "LODHA", "LUPIN", "MRF", "M&MFIN", "M&M",
     "MANKIND", "MARICO", "MARUTI", "MFSL", "MAXHEALTH", "MAZDOCK", "MOTILALOFS", "MPHASIS",
     "MUTHOOTFIN", "NHPC", "NMDC", "NTPCGREEN", "NTPC", "NATIONALUM", "NESTLEIND", "OBEROIRLTY",
     "ONGC", "OIL", "PAYTM", "OFSS", "POLICYBZR", "PIIND", "PAGEIND", "PATANJALI",
@@ -250,9 +250,12 @@ def sig_rsi_trend_shift(df, p):
 
 def get_strategies(p):
     return {
-        "EMA Crossover": lambda df: sig_ema(df, p),
-        "RSI + MACD":    lambda df: sig_rsi_macd(df, p),
-        "Bollinger":     lambda df: sig_bb(df, p),
+        "EMA Crossover":    lambda df: sig_ema(df, p),
+        "RSI + MACD":       lambda df: sig_rsi_macd(df, p),
+        "Bollinger":        lambda df: sig_bb(df, p),
+        "Donchian":         lambda df: sig_donchian(df, p),
+        "Volume Breakout":  lambda df: sig_volume_breakout(df, p),
+        "RSI Trend Shift":  lambda df: sig_rsi_trend_shift(df, p),
     }
 
 # ─────────────────────────────────────────────
@@ -549,7 +552,6 @@ def run():
                 date=today,
                 ticker=ticker,
                 action=action,
-                score=int(round(c_score)) if c_score is not None else 0,
                 raw_score=int(buy_count if action == "BUY" else sell_count),
                 weighted_score_val=float(w_ratio) if w_ratio is not None else 0.0,
                 composite_score=float(c_score) if c_score is not None else 0.0,
