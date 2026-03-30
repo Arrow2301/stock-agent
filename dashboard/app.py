@@ -448,82 +448,78 @@ if page == "📊 Today's Signals":
     top6.metric("Market", meta.get("market_regime", "?"))
 
     with st.expander("🔧 Filters & Ranking", expanded=True):
-        f1, f2, f3, f4 = st.columns(4)
-        min_cs = f1.slider("Min Composite Score", 0, 100, 30)
-        min_wr = f2.slider("Min Win Rate %", 0, 100, 40)
-        min_pf = f3.slider("Min Profit Factor", 0.0, 5.0, 0.8, 0.1)
-        action_filter = f4.selectbox("Action", ["All", "BUY", "SELL"])
+    f1, f2, f3, f4 = st.columns(4)
+    min_cs = f1.slider("Min Composite Score", 0, 100, 30)
+    min_wr = f2.slider("Min Positive Return Rate %", 0, 100, 40)
+    min_pf = f3.slider("Min Profit Factor", 0.0, 5.0, 0.8, 0.1)
+    action_filter = f4.selectbox("Action", ["All", "BUY", "SELL"])
 
-        f5, f6, f7 = st.columns(3)
-        ticker_query = f5.text_input("Ticker search", "")
-        regime_filter = f6.selectbox("Market regime", ["All", "BULLISH", "NEUTRAL", "BEARISH", "UNKNOWN"])
-        sort_col = f7.selectbox(
-            "Sort by",
-            [
-                "composite_score", "win_rate", "profit_factor", "avg_return",
-                "rsi", "reward_pct", "risk_pct", "weighted_score_val"
-            ],
-            index=0
-        )
-
-        filtered = recs.copy()
-        filtered = filtered[
-            (filtered.composite_score.fillna(0) >= min_cs) &
-            (filtered.win_rate.fillna(0) >= min_wr) &
-            (filtered.profit_factor.fillna(0) >= min_pf)
-        ]
-
-        if action_filter != "All":
-            filtered = filtered[filtered.action == action_filter]
-
-        if ticker_query.strip():
-            filtered = filtered[filtered.ticker.astype(str).str.contains(ticker_query.strip(), case=False, na=False)]
-
-        if regime_filter != "All" and "market_regime" in filtered.columns:
-            filtered = filtered[filtered.market_regime == regime_filter]
-
-        ascending = True if sort_col in ["risk_pct", "rsi"] else False
-        if sort_col in filtered.columns:
-            filtered = filtered.sort_values(sort_col, ascending=ascending, na_position="last")
-
-    if filtered.empty:
-        st.warning("No signals match the selected filters.")
-        st.stop()
-
-    st.subheader("📋 Signal Leaderboard")
-    board = filtered.copy()
-    show_cols = [
-        "ticker", "action", "composite_score", "score_label", "win_rate",
-        "profit_factor", "avg_return", "rsi", "price", "stop_loss",
-        "target", "reward_pct", "risk_pct", "market_regime", "active_strategies"
-    ]
-    show_cols = [c for c in show_cols if c in board.columns]
-    board_show = board[show_cols].copy()
-
-    rename_map = {
-        "ticker": "Ticker",
-        "action": "Action",
-        "composite_score": "Score",
-        "score_label": "Label",
-        "win_rate": "Win Rate %",
-        "profit_factor": "PF",
-        "avg_return": "Avg Ret %",
-        "rsi": "RSI",
-        "price": "Price",
-        "stop_loss": "Stop Loss",
-        "target": "Target",
-        "reward_pct": "Reward %",
-        "risk_pct": "Risk %",
-        "market_regime": "Regime",
-        "active_strategies": "Strategies",
-    }
-    board_show = board_show.rename(columns=rename_map)
-    st.dataframe(
-        board_show,
-        use_container_width=True,
-        hide_index=True
+    f5, f6, f7 = st.columns(3)
+    ticker_query = f5.text_input("Ticker search", "")
+    regime_filter = f6.selectbox("Market regime", ["All", "BULLISH", "NEUTRAL", "BEARISH", "UNKNOWN"])
+    sort_col = f7.selectbox(
+        "Sort by",
+        [
+            "composite_score", "win_rate", "profit_factor", "avg_return",
+            "rsi", "reward_pct", "risk_pct", "weighted_score_val"
+        ],
+        index=0
     )
 
+    filtered = recs.copy()
+    filtered = filtered[
+        (filtered.composite_score.fillna(0) >= min_cs) &
+        (filtered.win_rate.fillna(0) >= min_wr) &
+        (filtered.profit_factor.fillna(0) >= min_pf)
+    ]
+
+    if action_filter != "All":
+        filtered = filtered[filtered.action == action_filter]
+
+    if ticker_query.strip():
+        filtered = filtered[filtered.ticker.astype(str).str.contains(ticker_query.strip(), case=False, na=False)]
+
+    if regime_filter != "All" and "market_regime" in filtered.columns:
+        filtered = filtered[filtered.market_regime == regime_filter]
+
+    ascending = True if sort_col in ["risk_pct", "rsi"] else False
+    if sort_col in filtered.columns:
+        filtered = filtered.sort_values(sort_col, ascending=ascending, na_position="last")
+
+st.subheader("📋 Signal Leaderboard")
+board = filtered.copy()
+show_cols = [
+    "ticker", "action", "composite_score", "score_label", "win_rate",
+    "profit_factor", "avg_return", "rsi", "price", "stop_loss",
+    "target", "reward_pct", "risk_pct", "market_regime", "active_strategies"
+]
+show_cols = [c for c in show_cols if c in board.columns]
+board_show = board[show_cols].copy()
+
+rename_map = {
+    "ticker": "Ticker",
+    "action": "Action",
+    "composite_score": "Score",
+    "score_label": "Label",
+    "win_rate": "Positive Return %",
+    "profit_factor": "PF",
+    "avg_return": "Avg Ret %",
+    "rsi": "RSI",
+    "price": "Price",
+    "stop_loss": "Stop Loss",
+    "target": "Target",
+    "reward_pct": "Reward %",
+    "risk_pct": "Risk %",
+    "market_regime": "Regime",
+    "active_strategies": "Strategies",
+}
+board_show = board_show.rename(columns=rename_map)
+st.dataframe(
+    board_show,
+    use_container_width=True,
+    hide_index=True
+)
+    
     chosen_ticker = st.selectbox("Open details for ticker", filtered["ticker"].tolist())
     selected = filtered[filtered["ticker"] == chosen_ticker].iloc[0]
 
