@@ -448,78 +448,84 @@ if page == "📊 Today's Signals":
     top6.metric("Market", meta.get("market_regime", "?"))
 
     with st.expander("🔧 Filters & Ranking", expanded=True):
-    f1, f2, f3, f4 = st.columns(4)
-    min_cs = f1.slider("Min Composite Score", 0, 100, 30)
-    min_wr = f2.slider("Min Positive Return Rate %", 0, 100, 40)
-    min_pf = f3.slider("Min Profit Factor", 0.0, 5.0, 0.8, 0.1)
-    action_filter = f4.selectbox("Action", ["All", "BUY", "SELL"])
+        f1, f2, f3, f4 = st.columns(4)
+        min_cs = f1.slider("Min Composite Score", 0, 100, 30)
+        min_wr = f2.slider("Min Positive Return Rate %", 0, 100, 40)
+        min_pf = f3.slider("Min Profit Factor", 0.0, 5.0, 0.8, 0.1)
+        action_filter = f4.selectbox("Action", ["All", "BUY", "SELL"])
 
-    f5, f6, f7 = st.columns(3)
-    ticker_query = f5.text_input("Ticker search", "")
-    regime_filter = f6.selectbox("Market regime", ["All", "BULLISH", "NEUTRAL", "BEARISH", "UNKNOWN"])
-    sort_col = f7.selectbox(
-        "Sort by",
-        [
-            "composite_score", "win_rate", "profit_factor", "avg_return",
-            "rsi", "reward_pct", "risk_pct", "weighted_score_val"
-        ],
-        index=0
+        f5, f6, f7 = st.columns(3)
+        ticker_query = f5.text_input("Ticker search", "")
+        regime_filter = f6.selectbox("Market regime", ["All", "BULLISH", "NEUTRAL", "BEARISH", "UNKNOWN"])
+        sort_col = f7.selectbox(
+            "Sort by",
+            [
+                "composite_score", "win_rate", "profit_factor", "avg_return",
+                "rsi", "reward_pct", "risk_pct", "weighted_score_val"
+            ],
+            index=0
+        )
+
+        filtered = recs.copy()
+        filtered = filtered[
+            (filtered.composite_score.fillna(0) >= min_cs) &
+            (filtered.win_rate.fillna(0) >= min_wr) &
+            (filtered.profit_factor.fillna(0) >= min_pf)
+        ]
+
+        if action_filter != "All":
+            filtered = filtered[filtered.action == action_filter]
+
+        if ticker_query.strip():
+            filtered = filtered[
+                filtered.ticker.astype(str).str.contains(ticker_query.strip(), case=False, na=False)
+            ]
+
+        if regime_filter != "All" and "market_regime" in filtered.columns:
+            filtered = filtered[filtered.market_regime == regime_filter]
+
+        ascending = True if sort_col in ["risk_pct", "rsi"] else False
+        if sort_col in filtered.columns:
+            filtered = filtered.sort_values(sort_col, ascending=ascending, na_position="last")
+
+    st.subheader("📋 Signal Leaderboard")
+    board = filtered.copy()
+    show_cols = [
+        "ticker", "action", "composite_score", "score_label", "win_rate",
+        "profit_factor", "avg_return", "rsi", "price", "stop_loss",
+        "target", "reward_pct", "risk_pct", "market_regime", "active_strategies"
+    ]
+    show_cols = [c for c in show_cols if c in board.columns]
+    board_show = board[show_cols].copy()
+
+    rename_map = {
+        "ticker": "Ticker",
+        "action": "Action",
+        "composite_score": "Score",
+        "score_label": "Label",
+        "win_rate": "Positive Return %",
+        "profit_factor": "PF",
+        "avg_return": "Avg Ret %",
+        "rsi": "RSI",
+        "price": "Price",
+        "stop_loss": "Stop Loss",
+        "target": "Target",
+        "reward_pct": "Reward %",
+        "risk_pct": "Risk %",
+        "market_regime": "Regime",
+        "active_strategies": "Strategies",
+    }
+    board_show = board_show.rename(columns=rename_map)
+    st.dataframe(
+        board_show,
+        use_container_width=True,
+        hide_index=True
     )
 
-    filtered = recs.copy()
-    filtered = filtered[
-        (filtered.composite_score.fillna(0) >= min_cs) &
-        (filtered.win_rate.fillna(0) >= min_wr) &
-        (filtered.profit_factor.fillna(0) >= min_pf)
-    ]
+    if filtered.empty:
+        st.warning("No signals match the selected filters.")
+        st.stop()
 
-    if action_filter != "All":
-        filtered = filtered[filtered.action == action_filter]
-
-    if ticker_query.strip():
-        filtered = filtered[filtered.ticker.astype(str).str.contains(ticker_query.strip(), case=False, na=False)]
-
-    if regime_filter != "All" and "market_regime" in filtered.columns:
-        filtered = filtered[filtered.market_regime == regime_filter]
-
-    ascending = True if sort_col in ["risk_pct", "rsi"] else False
-    if sort_col in filtered.columns:
-        filtered = filtered.sort_values(sort_col, ascending=ascending, na_position="last")
-
-st.subheader("📋 Signal Leaderboard")
-board = filtered.copy()
-show_cols = [
-    "ticker", "action", "composite_score", "score_label", "win_rate",
-    "profit_factor", "avg_return", "rsi", "price", "stop_loss",
-    "target", "reward_pct", "risk_pct", "market_regime", "active_strategies"
-]
-show_cols = [c for c in show_cols if c in board.columns]
-board_show = board[show_cols].copy()
-
-rename_map = {
-    "ticker": "Ticker",
-    "action": "Action",
-    "composite_score": "Score",
-    "score_label": "Label",
-    "win_rate": "Positive Return %",
-    "profit_factor": "PF",
-    "avg_return": "Avg Ret %",
-    "rsi": "RSI",
-    "price": "Price",
-    "stop_loss": "Stop Loss",
-    "target": "Target",
-    "reward_pct": "Reward %",
-    "risk_pct": "Risk %",
-    "market_regime": "Regime",
-    "active_strategies": "Strategies",
-}
-board_show = board_show.rename(columns=rename_map)
-st.dataframe(
-    board_show,
-    use_container_width=True,
-    hide_index=True
-)
-    
     chosen_ticker = st.selectbox("Open details for ticker", filtered["ticker"].tolist())
     selected = filtered[filtered["ticker"] == chosen_ticker].iloc[0]
 
@@ -534,14 +540,14 @@ st.dataframe(
             unsafe_allow_html=True
         )
         if bool(selected.get("low_sample_warning", False)):
-            st.warning("⚠️ Fewer than 5 backtest trades — treat win rate cautiously.")
+            st.warning("⚠️ Fewer than 5 backtest trades — treat positive-return stats cautiously.")
 
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Price", fmt_inr(selected.get("price")))
         m1.metric("1D", fmt_pct(selected.get("change_1d")))
         m1.metric("5D", fmt_pct(selected.get("change_5d")))
         m2.metric("RSI", fmt_num(selected.get("rsi"), 1))
-        m2.metric("WR", fmt_pct(selected.get("win_rate"), 1, signed=False))
+        m2.metric("Positive Trades", fmt_pct(selected.get("win_rate"), 1, signed=False))
         m2.metric("PF", fmt_num(selected.get("profit_factor"), 2))
         m3.metric("Stop Loss", fmt_inr(selected.get("stop_loss")))
         m3.metric("Target", fmt_inr(selected.get("target")))
@@ -603,7 +609,7 @@ st.dataframe(
             "Strategy": name,
             "Signal": "BUY" if val == 1 else ("SELL" if val == -1 else "None"),
             "Weight": safe_float(wts.get(name, 0)),
-            "Win Rate %": safe_float(b.get("win_rate", 0)),
+            "Positive Return %": safe_float(b.get("win_rate", 0)),
             "Avg Return %": safe_float(b.get("avg_return", 0)),
             "Median Return %": safe_float(b.get("median_return", 0)),
             "Profit Factor": safe_float(b.get("profit_factor", 0)),
@@ -624,6 +630,7 @@ st.dataframe(
         paper_buy(selected.ticker, price, qty, sl_in, tg_in, notes, str(selected.get("id", "")))
         st.success(f"✅ Paper bought {qty} × {selected.ticker} @ ₹{price:.2f}")
         st.balloons()
+
 
 # ─────────────────────────────────────────────
 #  PAGE: PAPER PORTFOLIO
@@ -782,7 +789,10 @@ elif page == "📅 Signal History":
 # ─────────────────────────────────────────────
 elif page == "📈 Strategy Stats":
     st.title("📈 Strategy Performance Stats")
-    st.caption("Historical strategy stats can mix old and new live strategy sets. Use the filter below to focus on current live strategies.")
+    st.caption(
+        "Positive Return Rate = % of backtest trades with return > 0. "
+        "Stop-loss / target / timeout counts are shown separately and do not define this rate."
+    )
 
     res = sb.table("recommendations").select(
         "ticker,backtest,action,win_rate,avg_return,composite_score,profit_factor,max_drawdown,median_return,date,param_version"
@@ -807,6 +817,41 @@ elif page == "📈 Strategy Stats":
         "RSI Trend Shift",
     ]
 
+    def clean_trade_returns(values):
+        cleaned = []
+        if not isinstance(values, list):
+            return cleaned
+        for v in values:
+            try:
+                if v is None or pd.isna(v):
+                    continue
+                cleaned.append(float(v))
+            except Exception:
+                continue
+        return cleaned
+
+    def summarize_returns(values):
+        arr = pd.Series(values, dtype="float64").dropna()
+        if arr.empty:
+            return {
+                "Positive_Return_Rate": np.nan,
+                "Avg_Return": np.nan,
+                "Median_Return": np.nan,
+                "Return_Std": np.nan,
+                "P10": np.nan,
+                "P90": np.nan,
+                "Trades": 0,
+            }
+        return {
+            "Positive_Return_Rate": float((arr > 0).mean() * 100),
+            "Avg_Return": float(arr.mean()),
+            "Median_Return": float(arr.median()),
+            "Return_Std": float(arr.std(ddof=0)) if len(arr) > 1 else 0.0,
+            "P10": float(arr.quantile(0.10)),
+            "P90": float(arr.quantile(0.90)),
+            "Trades": int(arr.size),
+        }
+
     f1, f2 = st.columns(2)
     strategy_mode = f1.selectbox(
         "Strategy view",
@@ -821,6 +866,7 @@ elif page == "📈 Strategy Stats":
         all_recs = all_recs[all_recs["date"] >= cutoff].copy()
 
     rows = []
+    trade_return_rows = []
     observed_strategies = set()
     for _, r in all_recs.iterrows():
         try:
@@ -834,17 +880,34 @@ elif page == "📈 Strategy Stats":
                 if not isinstance(stats, dict):
                     stats = {}
 
+                trade_returns = clean_trade_returns(stats.get("trade_returns", []))
+                trades_count = len(trade_returns) if trade_returns else safe_int(stats.get("trades", 0))
+                positive_rate = (
+                    round(sum(t > 0 for t in trade_returns) / len(trade_returns) * 100, 1)
+                    if trade_returns else safe_float(stats.get("win_rate", np.nan), np.nan)
+                )
+
                 rows.append({
                     "Strategy": name,
-                    "Win Rate": stats.get("win_rate", 0),
-                    "Avg Return": stats.get("avg_return", 0),
-                    "Median Return": stats.get("median_return", 0),
-                    "Profit Factor": stats.get("profit_factor", 0),
-                    "Max Drawdown": stats.get("max_drawdown", 0),
-                    "SL Exits": stats.get("sl_exits", 0),
-                    "Target Exits": stats.get("target_exits", 0),
-                    "Trades": stats.get("trades", 0),
+                    "Positive Return Rate": positive_rate,
+                    "Avg Return": safe_float(stats.get("avg_return", np.nan), np.nan),
+                    "Median Return": safe_float(stats.get("median_return", np.nan), np.nan),
+                    "Profit Factor": safe_float(stats.get("profit_factor", np.nan), np.nan),
+                    "Max Drawdown": safe_float(stats.get("max_drawdown", np.nan), np.nan),
+                    "SL Exits": safe_int(stats.get("sl_exits", 0)),
+                    "Target Exits": safe_int(stats.get("target_exits", 0)),
+                    "Timeout Exits": safe_int(stats.get("timeout_exits", 0)),
+                    "Trades": trades_count,
                 })
+
+                for tr in trade_returns:
+                    trade_return_rows.append({
+                        "Strategy": name,
+                        "Return %": float(tr),
+                        "Date": r.get("date"),
+                        "Param Version": r.get("param_version"),
+                        "Ticker": r.get("ticker"),
+                    })
         except Exception:
             continue
 
@@ -857,7 +920,7 @@ elif page == "📈 Strategy Stats":
     if not rows:
         agg = pd.DataFrame({
             "Strategy": expected_strategies,
-            "Win_Rate": np.nan,
+            "Positive_Return_Rate": np.nan,
             "Avg_Return": np.nan,
             "Median_Return": np.nan,
             "Profit_Factor": np.nan,
@@ -865,26 +928,63 @@ elif page == "📈 Strategy Stats":
             "Total_Trades": 0,
             "SL_Exits": 0,
             "Target_Exits": 0,
+            "Timeout_Exits": 0,
         })
+        returns_df = pd.DataFrame(columns=["Strategy", "Return %", "Date", "Param Version", "Ticker"])
     else:
         bt_df = pd.DataFrame(rows)
-        agg = bt_df.groupby("Strategy").agg(
-            Win_Rate=("Win Rate", "mean"),
-            Avg_Return=("Avg Return", "mean"),
-            Median_Return=("Median Return", "mean"),
-            Profit_Factor=("Profit Factor", "mean"),
-            Max_Drawdown=("Max Drawdown", "mean"),
-            Total_Trades=("Trades", "sum"),
-            SL_Exits=("SL Exits", "sum"),
-            Target_Exits=("Target Exits", "sum"),
+
+        def weighted_avg(group, value_col, weight_col="Trades"):
+            weights = pd.to_numeric(group[weight_col], errors="coerce").fillna(0)
+            values = pd.to_numeric(group[value_col], errors="coerce")
+            valid = (~values.isna()) & (weights > 0)
+            if not valid.any():
+                return np.nan
+            return float(np.average(values[valid], weights=weights[valid]))
+
+        agg = bt_df.groupby("Strategy").apply(
+            lambda g: pd.Series({
+                "Positive_Return_Rate": weighted_avg(g, "Positive Return Rate"),
+                "Avg_Return": weighted_avg(g, "Avg Return"),
+                "Median_Return": float(pd.to_numeric(g["Median Return"], errors="coerce").mean()),
+                "Profit_Factor": float(pd.to_numeric(g["Profit Factor"], errors="coerce").mean()),
+                "Max_Drawdown": float(pd.to_numeric(g["Max Drawdown"], errors="coerce").mean()),
+                "Total_Trades": int(pd.to_numeric(g["Trades"], errors="coerce").fillna(0).sum()),
+                "SL_Exits": int(pd.to_numeric(g["SL Exits"], errors="coerce").fillna(0).sum()),
+                "Target_Exits": int(pd.to_numeric(g["Target Exits"], errors="coerce").fillna(0).sum()),
+                "Timeout_Exits": int(pd.to_numeric(g["Timeout Exits"], errors="coerce").fillna(0).sum()),
+            })
         ).reset_index()
 
-        agg = (
-            pd.DataFrame({"Strategy": expected_strategies})
-            .merge(agg, on="Strategy", how="left")
-        )
-        count_cols = ["Total_Trades", "SL_Exits", "Target_Exits"]
+        agg = pd.DataFrame({"Strategy": expected_strategies}).merge(agg, on="Strategy", how="left")
+        count_cols = ["Total_Trades", "SL_Exits", "Target_Exits", "Timeout_Exits"]
         agg[count_cols] = agg[count_cols].fillna(0).astype(int)
+
+        returns_df = pd.DataFrame(trade_return_rows) if trade_return_rows else pd.DataFrame(
+            columns=["Strategy", "Return %", "Date", "Param Version", "Ticker"]
+        )
+
+        if not returns_df.empty:
+            exact_rows = []
+            for strat, grp in returns_df.groupby("Strategy"):
+                summary = summarize_returns(grp["Return %"].tolist())
+                exact_rows.append({
+                    "Strategy": strat,
+                    "Positive_Return_Rate_exact": summary["Positive_Return_Rate"],
+                    "Avg_Return_exact": summary["Avg_Return"],
+                    "Median_Return_exact": summary["Median_Return"],
+                    "Total_Trades_exact": summary["Trades"],
+                })
+            exact_df = pd.DataFrame(exact_rows)
+            agg = agg.merge(exact_df, on="Strategy", how="left")
+            for target, source in [
+                ("Positive_Return_Rate", "Positive_Return_Rate_exact"),
+                ("Avg_Return", "Avg_Return_exact"),
+                ("Median_Return", "Median_Return_exact"),
+                ("Total_Trades", "Total_Trades_exact"),
+            ]:
+                agg[target] = agg[source].combine_first(agg[target])
+            agg = agg.drop(columns=[c for c in agg.columns if c.endswith("_exact")])
 
     if strategy_mode == "Current live strategies only":
         st.success("Showing only the current live strategy basket: EMA Crossover, RSI + MACD, Bollinger.")
@@ -895,6 +995,15 @@ elif page == "📈 Strategy Stats":
     if missing:
         st.info("Included with no samples in the selected window: " + ", ".join(missing))
 
+    if returns_df.empty:
+        st.info("Return histograms will appear after fresh analysis runs save `trade_returns` into backtest JSON.")
+    else:
+        strategies_with_hist = sorted(returns_df["Strategy"].dropna().unique().tolist())
+        if len(strategies_with_hist) < len(expected_strategies):
+            unavailable = [s for s in expected_strategies if s not in strategies_with_hist]
+            if unavailable:
+                st.caption("Histogram unavailable for older rows without stored trade returns: " + ", ".join(unavailable))
+
     for _, row in agg.iterrows():
         if 0 < row.Total_Trades < 20:
             st.warning(f"⚠️ **{row.Strategy}**: only {int(row.Total_Trades)} trades — interpret cautiously.")
@@ -903,15 +1012,15 @@ elif page == "📈 Strategy Stats":
 
     with c1:
         win_plot = agg.copy()
-        win_plot["Win_Rate"] = win_plot["Win_Rate"].fillna(0)
+        win_plot["Positive_Return_Rate"] = win_plot["Positive_Return_Rate"].fillna(0)
         fig = px.bar(
             win_plot,
             x="Strategy",
-            y="Win_Rate",
-            color="Win_Rate",
+            y="Positive_Return_Rate",
+            color="Positive_Return_Rate",
             color_continuous_scale="teal",
-            text="Win_Rate",
-            title="Win Rate %"
+            text="Positive_Return_Rate",
+            title="Positive Return Rate %"
         )
         fig.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
         fig.update_layout(
@@ -946,7 +1055,7 @@ elif page == "📈 Strategy Stats":
 
     st.dataframe(
         agg.style.format({
-            "Win_Rate": "{:.1f}%",
+            "Positive_Return_Rate": "{:.1f}%",
             "Avg_Return": "{:+.2f}%",
             "Median_Return": "{:+.2f}%",
             "Profit_Factor": "{:.2f}",
@@ -955,6 +1064,47 @@ elif page == "📈 Strategy Stats":
         use_container_width=True,
         hide_index=True
     )
+
+    if not returns_df.empty:
+        st.divider()
+        st.subheader("📊 Return % Histogram by Strategy")
+        h1, h2 = st.columns([2, 1])
+        selected_strategy = h1.selectbox("Select strategy", sorted(returns_df["Strategy"].unique().tolist()))
+        bins = h2.slider("Bins", 10, 60, 24)
+
+        strat_returns = returns_df[returns_df["Strategy"] == selected_strategy].copy()
+        summary = summarize_returns(strat_returns["Return %"].tolist())
+
+        hs1, hs2, hs3, hs4, hs5 = st.columns(5)
+        hs1.metric("Trades", summary["Trades"])
+        hs2.metric("Positive Return Rate", f"{summary['Positive_Return_Rate']:.1f}%")
+        hs3.metric("Avg Return", f"{summary['Avg_Return']:+.2f}%")
+        hs4.metric("Median Return", f"{summary['Median_Return']:+.2f}%")
+        hs5.metric("Std Dev", f"{summary['Return_Std']:.2f}%")
+
+        fig_hist = px.histogram(
+            strat_returns,
+            x="Return %",
+            nbins=bins,
+            marginal="box",
+            title=f"{selected_strategy} — distribution of backtest trade returns"
+        )
+        fig_hist.add_vline(x=0, line_dash="dash", line_color="#ef5350")
+        if not np.isnan(summary["Avg_Return"]):
+            fig_hist.add_vline(x=summary["Avg_Return"], line_dash="dot", line_color="#26a69a")
+        fig_hist.update_layout(
+            height=380,
+            bargap=0.06,
+            plot_bgcolor="rgba(0,0,0,0)",
+            paper_bgcolor="rgba(0,0,0,0)",
+            margin=dict(t=40, b=10, l=0, r=0),
+        )
+        st.plotly_chart(fig_hist, use_container_width=True)
+        st.caption(
+            f"10th percentile: {summary['P10']:+.2f}% | "
+            f"90th percentile: {summary['P90']:+.2f}% | "
+            "Dashed red line = 0% return, dotted green line = mean return."
+        )
 
     closed = load_portfolio()
     if not closed.empty:
@@ -990,9 +1140,7 @@ elif page == "📈 Strategy Stats":
                 )
                 st.plotly_chart(fig_sc, use_container_width=True)
 
-# ─────────────────────────────────────────────
-#  PAGE: OPTIMIZER
-# ─────────────────────────────────────────────
+
 elif page == "🤖 Optimizer":
     st.title("🤖 Parameter Optimizer")
     st.caption("Champion, challenger, full version history, promotion controls, and optimization runs.")
@@ -1017,7 +1165,7 @@ elif page == "🤖 Optimizer":
             st.success(f"**v{r['version']}** | Score: {safe_float(r['objective_score']):.4f}")
             st.caption(
                 f"PF: {safe_float(r.get('profit_factor', 0)):.2f} | "
-                f"WR: {safe_float(r.get('win_rate', 0)):.1f}% | "
+                f"Positive %: {safe_float(r.get('win_rate', 0)):.1f}% | "
                 f"Avg Ret: {safe_float(r.get('avg_return', 0)):+.2f}% | "
                 f"Max DD: {safe_float(r.get('max_drawdown', 0)):.1f}%"
             )
@@ -1035,7 +1183,7 @@ elif page == "🤖 Optimizer":
             st.info(f"**v{r['version']}** | Score: {safe_float(r['objective_score']):.4f} {marker} {delta:+.4f} vs champion")
             st.caption(
                 f"PF: {safe_float(r.get('profit_factor', 0)):.2f} | "
-                f"WR: {safe_float(r.get('win_rate', 0)):.1f}% | "
+                f"Positive %: {safe_float(r.get('win_rate', 0)):.1f}% | "
                 f"Avg Ret: {safe_float(r.get('avg_return', 0)):+.2f}% | "
                 f"Max DD: {safe_float(r.get('max_drawdown', 0)):.1f}%"
             )
@@ -1083,7 +1231,7 @@ elif page == "🤖 Optimizer":
         metrics_to_compare = [
             ("Objective Score", "objective_score"),
             ("Profit Factor", "profit_factor"),
-            ("Win Rate %", "win_rate"),
+            ("Positive Return %", "win_rate"),
             ("Avg Return %", "avg_return"),
             ("Max Drawdown %", "max_drawdown"),
         ]
@@ -1123,14 +1271,14 @@ elif page == "🤖 Optimizer":
             "max_drawdown", "total_trades", "run_date", "rank", "notes"
         ]].copy()
         cand_display.columns = [
-            "Version", "Score", "Profit Factor", "Win Rate %",
+            "Version", "Score", "Profit Factor", "Positive Return %",
             "Avg Return %", "Max Drawdown %", "Trades", "Run Date", "Rank", "Notes"
         ]
         st.dataframe(
             cand_display.style.format({
                 "Score": "{:.4f}",
                 "Profit Factor": "{:.2f}",
-                "Win Rate %": "{:.1f}%",
+                "Positive Return %": "{:.1f}%",
                 "Avg Return %": "{:+.2f}%",
                 "Max Drawdown %": "{:.1f}%"
             }),
@@ -1161,14 +1309,14 @@ elif page == "🤖 Optimizer":
         "avg_return", "max_drawdown", "total_trades", "run_date", "rank", "notes"
     ]].copy()
     all_display.columns = [
-        "Version", "Status", "Score", "Profit Factor", "Win Rate %",
+        "Version", "Status", "Score", "Profit Factor", "Positive Return %",
         "Avg Return %", "Max Drawdown %", "Trades", "Run Date", "Rank", "Notes"
     ]
     st.dataframe(
         all_display.style.format({
             "Score": "{:.4f}",
             "Profit Factor": "{:.2f}",
-            "Win Rate %": "{:.1f}%",
+            "Positive Return %": "{:.1f}%",
             "Avg Return %": "{:+.2f}%",
             "Max Drawdown %": "{:.1f}%"
         }),
