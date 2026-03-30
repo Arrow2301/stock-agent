@@ -136,11 +136,33 @@ def sig_bb(df, p):
     s[(df.High>=up)&(df.Close<up)&(r>50)]=-1
     return s
 
-def sig_supertrend(df, p):
-    trend,_=supertrend(df.High,df.Low,df.Close,p["ATR_PERIOD"],p["SUPERTREND_MULT"])
-    s=pd.Series(0,index=df.index)
-    s[(trend== 1)&(trend.shift()==-1)]= 1
-    s[(trend==-1)&(trend.shift()== 1)]=-1
+def sig_donchian(df, p):
+    period = int(p.get("DONCHIAN_PERIOD", 20))
+    hh = df.High.rolling(period).max()
+    ll = df.Low.rolling(period).min()
+    s = pd.Series(0, index=df.index)
+    s[(df.Close > hh.shift(1)) & (df.Close.shift(1) <= hh.shift(1))] = 1
+    s[(df.Close < ll.shift(1)) & (df.Close.shift(1) >= ll.shift(1))] = -1
+    return s
+
+def sig_volume_breakout(df, p):
+    period   = int(p.get("DONCHIAN_PERIOD", 20))
+    vol_mult = float(p.get("VOLUME_MULT", 1.5))
+    hh = df.High.rolling(period).max()
+    ll = df.Low.rolling(period).min()
+    avg_vol = df.Volume.rolling(20).mean()
+    s = pd.Series(0, index=df.index)
+    s[(df.Close > hh.shift(1)) & (df.Close.shift(1) <= hh.shift(1)) & (df.Volume > avg_vol * vol_mult)] = 1
+    s[(df.Close < ll.shift(1)) & (df.Close.shift(1) >= ll.shift(1)) & (df.Volume > avg_vol * vol_mult)] = -1
+    return s
+
+def sig_rsi_trend_shift(df, p):
+    r   = rsi(df.Close, p["RSI_PERIOD"])
+    e_l = ema(df.Close, p["EMA_LONG"])
+    mid = float(p.get("RSI_MIDLINE", 50))
+    s   = pd.Series(0, index=df.index)
+    s[(df.Close > e_l) & (r > mid) & (r.shift(1) <= mid)] = 1
+    s[(df.Close < e_l) & (r < mid) & (r.shift(1) >= mid)] = -1
     return s
 
 # ─────────────────────────────────────────────
@@ -225,10 +247,12 @@ def walk_forward_score(params: dict, all_data: dict) -> dict:
 
     all_metrics = []
     strategies  = [
-        ("EMA Crossover", lambda df: sig_ema(df, params)),
-        ("RSI + MACD",    lambda df: sig_rsi_macd(df, params)),
-        ("Bollinger",     lambda df: sig_bb(df, params)),
-        ("Supertrend",    lambda df: sig_supertrend(df, params)),
+        ("EMA Crossover",   lambda df: sig_ema(df, params)),
+        ("RSI + MACD",      lambda df: sig_rsi_macd(df, params)),
+        ("Bollinger",       lambda df: sig_bb(df, params)),
+        ("Donchian",        lambda df: sig_donchian(df, params)),
+        ("Volume Breakout", lambda df: sig_volume_breakout(df, params)),
+        ("RSI Trend Shift", lambda df: sig_rsi_trend_shift(df, params)),
     ]
 
     for trn_start, val_start, val_end in windows:
@@ -295,6 +319,10 @@ def make_objective(all_data):
             "BT_TARGET_PCT":      trial.suggest_float("BT_TARGET_PCT", 4.0, 18.0),
             "BT_MAX_HOLD":        trial.suggest_int(  "BT_MAX_HOLD",   3,  25),
             "MIN_WEIGHTED_SCORE": trial.suggest_float("MIN_WEIGHTED_SCORE",0.10,0.55),
+            # New strategy params
+            "DONCHIAN_PERIOD":    trial.suggest_int(  "DONCHIAN_PERIOD",  10, 40),
+            "VOLUME_MULT":        trial.suggest_float("VOLUME_MULT",      1.2,  3.0),
+            "RSI_MIDLINE":        trial.suggest_int(  "RSI_MIDLINE",      45,  55),
             # Composite score weights (sampled independently, normalised below)
             "W_STRATEGY":         40,  # kept fixed — strategy quality is the backbone
             "W_RSI":              trial.suggest_int("W_RSI",    10, 30),
@@ -448,6 +476,7 @@ def run():
         "ATR_PERIOD": 14, "SUPERTREND_MULT": 3.0,
         "BT_SL_PCT": 5.0, "BT_TARGET_PCT": 10.0, "BT_MAX_HOLD": 15,
         "MIN_WEIGHTED_SCORE": 0.28,
+        "DONCHIAN_PERIOD": 20, "VOLUME_MULT": 1.5, "RSI_MIDLINE": 50,
         "W_RSI": 20, "W_VOLUME": 15, "W_RR": 15, "W_REGIME": 10,
     }
     study.enqueue_trial(default_params_for_optuna)
@@ -491,11 +520,7 @@ def run():
         saved_ids.append(v)
         print(f"     Saved candidate v{v} (rank {i}, score={trial.value:.4f})")
 
-    # 5. Promote best candidate as 'challenger'
-    best_params  = {**top_trials[0].params, "W_STRATEGY": 40}
-    best_metrics = {**top_trials[0].user_attrs.get("metrics", {}), "_objective": top_trials[0].value}
     best_version = base_version
-
     champion = get_champion()
 
     if champion is None:
