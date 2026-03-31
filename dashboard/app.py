@@ -1,640 +1,1188 @@
-#!/usr/bin/env python3
 """
 ============================================================
-  Indian Stock Market Analysis Agent  —  v4
-  Runs daily via GitHub Actions at 7:00 AM IST
-
-  v4 live setup:
-  ─ Uses only 3 live strategies:
-      • EMA Crossover
-      • RSI + MACD
-      • Bollinger
-  ─ Lowers MIN_WEIGHTED_SCORE so single-strategy signals
-    like Bollinger can survive more often
-  ─ Keeps Supertrend only for context display
+  Indian Stock Agent — Dashboard v4
+  Improvements:
+  ─ Better signal filtering + ranking
+  ─ Safer null handling for live data
+  ─ Optimizer promotion flow fixed
+  ─ All parameter versions table
+  ─ Better portfolio + summary cards
 ============================================================
 """
 
-import os
-import sys
-import time
 import json
-import warnings
-import math
-from datetime import datetime, timedelta
+from datetime import datetime, date, timedelta
 
-import yfinance as yf
+import streamlit as st
 import pandas as pd
 import numpy as np
+import plotly.graph_objects as go
+import plotly.express as px
+import yfinance as yf
 from supabase import create_client, Client
 
-warnings.filterwarnings("ignore")
+# ─────────────────────────────────────────────
+#  PAGE CONFIG
+# ─────────────────────────────────────────────
+st.set_page_config(
+    page_title="🇮🇳 Stock Agent",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
 # ─────────────────────────────────────────────
 #  SUPABASE
 # ─────────────────────────────────────────────
-SUPABASE_URL = os.environ["SUPABASE_URL"]
-SUPABASE_KEY = os.environ["SUPABASE_KEY"]
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+@st.cache_resource
+def get_supabase() -> Client:
+    return create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
+
+sb = get_supabase()
 
 # ─────────────────────────────────────────────
-#  WATCHLIST
+#  PASSWORD GATE
 # ─────────────────────────────────────────────
-NIFTY50 = [
-    "360ONE", "ABB", "ACC", "APLAPOLLO", "AUBANK", "ADANIENSOL", "ADANIENT", "ADANIGREEN",
-    "ADANIPORTS", "ADANIPOWER", "ATGL", "ABCAPITAL", "ALKEM", "AMBUJACEM", "APOLLOHOSP", "ASHOKLEY",
-    "ASIANPAINT", "ASTRAL", "AUROPHARMA", "DMART", "AXISBANK", "BSE", "BAJAJ-AUTO", "BAJFINANCE",
-    "BAJAJFINSV", "BAJAJHLDNG", "BAJAJHFL", "BANKBARODA", "BANKINDIA", "BDL", "BEL", "BHARATFORG",
-    "BHEL", "BPCL", "BHARTIARTL", "BHARTIHEXA", "BIOCON", "BLUESTARCO", "BOSCHLTD", "BRITANNIA",
-    "CGPOWER", "CANBK", "CHOLAFIN", "CIPLA", "COALINDIA", "COCHINSHIP", "COFORGE", "COLPAL",
-    "CONCOR", "COROMANDEL", "CUMMINSIND", "DLF", "DABUR", "DIVISLAB", "DIXON", "DRREDDY",
-    "EICHERMOT", "ETERNAL", "EXIDEIND", "NYKAA", "FEDERALBNK", "FORTIS", "GAIL", "GMRAIRPORT",
-    "GLENMARK", "GODFRYPHLP", "GODREJCP", "GODREJPROP", "GRASIM", "HCLTECH", "HDFCAMC", "HDFCBANK",
-    "HDFCLIFE", "HAVELLS", "HEROMOTOCO", "HINDALCO", "HAL", "HINDPETRO", "HINDUNILVR", "HINDZINC",
-    "POWERINDIA", "HUDCO", "HYUNDAI", "ICICIBANK", "ICICIGI", "IDFCFIRSTB", "IRB", "ITCHOTELS",
-    "ITC", "INDIANB", "INDHOTEL", "IOC", "IRCTC", "IRFC", "IREDA", "IGL",
-    "INDUSTOWER", "INDUSINDBK", "NAUKRI", "INFY", "INDIGO", "JSWENERGY", "JSWSTEEL", "JINDALSTEL",
-    "JIOFIN", "JUBLFOOD", "KEI", "KPITTECH", "KALYANKJIL", "KOTAKBANK", "LTF", "LICHSGFIN",
-    "LTIM", "LT", "LICI", "LODHA", "LUPIN", "MRF", "M&MFIN", "M&M",
-    "MANKIND", "MARICO", "MARUTI", "MFSL", "MAXHEALTH", "MAZDOCK", "MOTILALOFS", "MPHASIS",
-    "MUTHOOTFIN", "NHPC", "NMDC", "NTPCGREEN", "NTPC", "NATIONALUM", "NESTLEIND", "OBEROIRLTY",
-    "ONGC", "OIL", "PAYTM", "OFSS", "POLICYBZR", "PIIND", "PAGEIND", "PATANJALI",
-    "PERSISTENT", "PHOENIXLTD", "PIDILITIND", "POLYCAB", "PFC", "POWERGRID", "PREMIERENE", "PRESTIGE",
-    "PNB", "RECLTD", "RVNL", "RELIANCE", "SBICARD", "SBILIFE", "SRF", "MOTHERSON",
-    "SHREECEM", "SHRIRAMFIN", "ENRIN", "SIEMENS", "SOLARINDS", "SONACOMS", "SBIN", "SAIL",
-    "SUNPHARMA", "SUPREMEIND", "SUZLON", "SWIGGY", "TVSMOTOR", "TATACOMM", "TCS", "TATACONSUM",
-    "TATAELXSI", "TMPV", "TATAPOWER", "TATASTEEL", "TATATECH", "TECHM", "TITAN", "TORNTPHARM",
-    "TORNTPOWER", "TRENT", "TIINDIA", "UPL", "ULTRACEMCO", "UNIONBANK", "UNITDSPR", "VBL",
-    "VEDL", "VMM", "IDEA", "VOLTAS", "WAAREEENER", "WIPRO", "YESBANK", "ZYDUSLIFE",
-]
-EXTRA_WATCHLIST = []
-ALL_TICKERS = NIFTY50 + EXTRA_WATCHLIST
+def check_password():
+    if st.session_state.get("authenticated"):
+        return True
 
-# ─────────────────────────────────────────────
-#  DEFAULT PARAMETERS
-# ─────────────────────────────────────────────
-DEFAULT_PARAMS = {
-    "EMA_SHORT":          9,
-    "EMA_LONG":           21,
-    "RSI_PERIOD":         14,
-    "RSI_OVERSOLD":       48,
-    "RSI_OVERBOUGHT":     58,
-    "RSI_MIDLINE":        50,
-    "MACD_FAST":          12,
-    "MACD_SLOW":          26,
-    "MACD_SIGNAL":        9,
-    "BB_PERIOD":          20,
-    "BB_STD":             2.0,
-    "DONCHIAN_PERIOD":    20,
-    "VOLUME_MULT":        1.2,
-    "ATR_PERIOD":         14,
-    "SUPERTREND_MULT":    3.0,
-    "BT_SL_PCT":          5.0,
-    "BT_TARGET_PCT":      10.0,
-    "BT_MAX_HOLD":        15,
-    "MIN_WEIGHTED_SCORE": 0.08,
-    "W_STRATEGY":         40,
-    "W_RSI":              20,
-    "W_VOLUME":           15,
-    "W_RR":               15,
-    "W_REGIME":           10,
-}
-
-# ─────────────────────────────────────────────
-#  LOAD ACTIVE PARAMS
-# ─────────────────────────────────────────────
-def load_active_params() -> tuple[dict, str]:
-    try:
-        res = (
-            supabase.table("agent_params")
-            .select("*")
-            .eq("status", "champion")
-            .order("promoted_at", desc=True)
-            .limit(1)
-            .execute()
-        )
-        if res.data:
-            row = res.data[0]
-            params = json.loads(row["params_json"]) if isinstance(row["params_json"], str) else row["params_json"]
-            merged = {**DEFAULT_PARAMS, **params}
-            return merged, f"v{row['version']} (score={row['objective_score']:.3f})"
-    except Exception as e:
-        print(f"  ⚠️ Could not load champion params: {e}")
-    return DEFAULT_PARAMS.copy(), "defaults"
-
-# ─────────────────────────────────────────────
-#  INDICATORS
-# ─────────────────────────────────────────────
-def ema(s, p):
-    return s.ewm(span=p, adjust=False).mean()
-
-def rsi(s, p=14):
-    d = s.diff()
-    ag = d.clip(lower=0).ewm(alpha=1 / p, min_periods=p, adjust=False).mean()
-    al = (-d.clip(upper=0)).ewm(alpha=1 / p, min_periods=p, adjust=False).mean()
-    return 100 - (100 / (1 + ag / al.replace(0, np.nan)))
-
-def macd(s, fast, slow, sig):
-    ml = ema(s, fast) - ema(s, slow)
-    sl = ema(ml, sig)
-    return ml, sl, ml - sl
-
-def bollinger(s, p, std):
-    m = s.rolling(p).mean()
-    sg = s.rolling(p).std()
-    return m + std * sg, m, m - std * sg
-
-def atr(h, l, c, p):
-    tr = pd.concat([(h - l), (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
-    return tr.ewm(alpha=1 / p, min_periods=p, adjust=False).mean()
-
-def supertrend(h, l, c, p, mult):
-    atr_v = atr(h, l, c, p)
-    hl2 = (h + l) / 2
-    up = hl2 + mult * atr_v
-    dn = hl2 - mult * atr_v
-    trend = pd.Series(1, index=c.index)
-    fu, fl = up.copy(), dn.copy()
-
-    for i in range(1, len(c)):
-        fu.iloc[i] = up.iloc[i] if (up.iloc[i] < fu.iloc[i - 1] or c.iloc[i - 1] > fu.iloc[i - 1]) else fu.iloc[i - 1]
-        fl.iloc[i] = dn.iloc[i] if (dn.iloc[i] > fl.iloc[i - 1] or c.iloc[i - 1] < fl.iloc[i - 1]) else fl.iloc[i - 1]
-        if trend.iloc[i - 1] == -1 and c.iloc[i] > fu.iloc[i]:
-            trend.iloc[i] = 1
-        elif trend.iloc[i - 1] == 1 and c.iloc[i] < fl.iloc[i]:
-            trend.iloc[i] = -1
+    st.title("🇮🇳 Indian Stock Agent")
+    pwd = st.text_input("Password", type="password")
+    if st.button("Login"):
+        if pwd == st.secrets.get("DASHBOARD_PASSWORD", "stockagent123"):
+            st.session_state.authenticated = True
+            st.rerun()
         else:
-            trend.iloc[i] = trend.iloc[i - 1]
+            st.error("Incorrect password")
+    return False
 
-    return trend, pd.Series(np.where(trend == 1, fl, fu), index=c.index)
-
-# ─────────────────────────────────────────────
-#  SIGNAL GENERATORS
-# ─────────────────────────────────────────────
-def sig_ema(df, p):
-    e_s = ema(df.Close, p["EMA_SHORT"])
-    e_l = ema(df.Close, p["EMA_LONG"])
-    s = pd.Series(0, index=df.index)
-    s[(e_s > e_l) & (e_s.shift() <= e_l.shift())] = 1
-    s[(e_s < e_l) & (e_s.shift() >= e_l.shift())] = -1
-    return s
-
-def sig_rsi_macd(df, p):
-    r = rsi(df.Close, p["RSI_PERIOD"])
-    _, _, hist = macd(df.Close, p["MACD_FAST"], p["MACD_SLOW"], p["MACD_SIGNAL"])
-    s = pd.Series(0, index=df.index)
-    s[(r < p["RSI_OVERSOLD"]) & (hist > 0) & (hist.shift() <= 0)] = 1
-    s[(r > p["RSI_OVERBOUGHT"]) & (hist < 0) & (hist.shift() >= 0)] = -1
-    return s
-
-def sig_bb(df, p):
-    up, _, lo = bollinger(df.Close, p["BB_PERIOD"], p["BB_STD"])
-    r = rsi(df.Close, p["RSI_PERIOD"])
-    s = pd.Series(0, index=df.index)
-    s[(df.Low <= lo) & (df.Close > lo) & (r < 50)] = 1
-    s[(df.High >= up) & (df.Close < up) & (r > 50)] = -1
-    return s
-
-def sig_donchian(df, p):
-    period = int(p.get("DONCHIAN_PERIOD", 20))
-    hh = df.High.rolling(period).max()
-    ll = df.Low.rolling(period).min()
-    s = pd.Series(0, index=df.index)
-    s[(df.Close > hh.shift(1)) & (df.Close.shift(1) <= hh.shift(1))] = 1
-    s[(df.Close < ll.shift(1)) & (df.Close.shift(1) >= ll.shift(1))] = -1
-    return s
-
-def sig_volume_breakout(df, p):
-    period = int(p.get("DONCHIAN_PERIOD", 20))
-    vol_mult = float(p.get("VOLUME_MULT", 1.5))
-    hh = df.High.rolling(period).max()
-    ll = df.Low.rolling(period).min()
-    avg_vol = df.Volume.rolling(20).mean()
-    s = pd.Series(0, index=df.index)
-
-    buy_cond = (
-        (df.Close > hh.shift(1)) &
-        (df.Close.shift(1) <= hh.shift(1)) &
-        (df.Volume > avg_vol * vol_mult)
-    )
-    sell_cond = (
-        (df.Close < ll.shift(1)) &
-        (df.Close.shift(1) >= ll.shift(1)) &
-        (df.Volume > avg_vol * vol_mult)
-    )
-
-    s[buy_cond] = 1
-    s[sell_cond] = -1
-    return s
-
-def sig_rsi_trend_shift(df, p):
-    r = rsi(df.Close, p["RSI_PERIOD"])
-    e_l = ema(df.Close, p["EMA_LONG"])
-    mid = float(p.get("RSI_MIDLINE", 50))
-    s = pd.Series(0, index=df.index)
-
-    buy_cond = (
-        (df.Close > e_l) &
-        (r > mid) &
-        (r.shift(1) <= mid)
-    )
-    sell_cond = (
-        (df.Close < e_l) &
-        (r < mid) &
-        (r.shift(1) >= mid)
-    )
-
-    s[buy_cond] = 1
-    s[sell_cond] = -1
-    return s
-
-def get_strategies(p):
-    return {
-        "EMA Crossover":    lambda df: sig_ema(df, p),
-        "RSI + MACD":       lambda df: sig_rsi_macd(df, p),
-        "Bollinger":        lambda df: sig_bb(df, p),
-        "Donchian":         lambda df: sig_donchian(df, p),
-        "Volume Breakout":  lambda df: sig_volume_breakout(df, p),
-        "RSI Trend Shift":  lambda df: sig_rsi_trend_shift(df, p),
-    }
+if not check_password():
+    st.stop()
 
 # ─────────────────────────────────────────────
-#  BACKTEST
+#  FORMAT HELPERS
 # ─────────────────────────────────────────────
-def backtest(df, signals, p):
-    trades, reasons = [], []
-    in_t, ep, entry_idx = False, 0.0, -1
-    closes, highs, lows, opens = df.Close.values, df.High.values, df.Low.values, df.Open.values
-    sl_pct = p["BT_SL_PCT"]
-    tgt_pct = p["BT_TARGET_PCT"]
-    max_hold = p["BT_MAX_HOLD"]
+def safe_float(v, default=0.0):
+    try:
+        if v is None:
+            return default
+        if pd.isna(v):
+            return default
+        return float(v)
+    except Exception:
+        return default
 
-    for i in range(1, len(df)):
-        if in_t:
-            sl_px = ep * (1 - sl_pct / 100)
-            tgt_px = ep * (1 + tgt_pct / 100)
-            if lows[i] <= sl_px:
-                trades.append((sl_px - ep) / ep * 100)
-                reasons.append("sl")
-                in_t = False
-            elif highs[i] >= tgt_px:
-                trades.append((tgt_px - ep) / ep * 100)
-                reasons.append("target")
-                in_t = False
-            elif i >= entry_idx + max_hold:
-                trades.append((closes[i] - ep) / ep * 100)
-                reasons.append("timeout")
-                in_t = False
+def safe_int(v, default=0):
+    try:
+        if v is None:
+            return default
+        if pd.isna(v):
+            return default
+        return int(v)
+    except Exception:
+        return default
 
-        if signals.iloc[i] == 1 and not in_t:
-            ep, entry_idx, in_t = opens[i], i, True
+def fmt_inr(v):
+    x = safe_float(v, None)
+    return "—" if x is None else f"₹{x:,.2f}"
 
-    if not trades:
-        return dict(
-            win_rate=0, avg_return=0, median_return=0, trades=0,
-            profit_factor=0, max_drawdown=0, sl_exits=0, target_exits=0,
-            timeout_exits=0, trade_returns=[]
-        )
+def fmt_pct(v, digits=2, signed=True):
+    x = safe_float(v, None)
+    if x is None:
+        return "—"
+    return f"{x:+.{digits}f}%" if signed else f"{x:.{digits}f}%"
 
-    wins = [t for t in trades if t > 0]
-    losses = [t for t in trades if t <= 0]
-    gp, gl = sum(wins), abs(sum(losses))
-    pf = round(gp / gl, 2) if gl > 0 else 99.0
-    eq = np.cumsum(trades)
-    peak = np.maximum.accumulate(eq)
-    max_dd = round(float(abs((eq - peak).min())), 2)
+def fmt_num(v, digits=2):
+    x = safe_float(v, None)
+    return "—" if x is None else f"{x:.{digits}f}"
 
-    return dict(
-        win_rate=round(len(wins) / len(trades) * 100, 1),
-        avg_return=round(float(np.mean(trades)), 2),
-        median_return=round(float(np.median(trades)), 2),
-        trades=len(trades),
-        profit_factor=min(float(pf), 99.0),
-        max_drawdown=max_dd,
-        sl_exits=reasons.count("sl"),
-        target_exits=reasons.count("target"),
-        timeout_exits=reasons.count("timeout"),
-        trade_returns=[round(t, 3) for t in trades],   # stored for histogram in dashboard
-    )
-
-# ─────────────────────────────────────────────
-#  JSON SANITIZER
-# ─────────────────────────────────────────────
-def sanitize_for_json(obj):
-    if isinstance(obj, dict):
-        return {k: sanitize_for_json(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [sanitize_for_json(v) for v in obj]
-    if isinstance(obj, tuple):
-        return [sanitize_for_json(v) for v in obj]
-    if isinstance(obj, np.generic):
-        obj = obj.item()
-    if isinstance(obj, float):
-        if math.isnan(obj) or math.isinf(obj):
-            return None
-        return obj
-    return obj
-
-# ─────────────────────────────────────────────
-#  WEIGHTED VOTE + COMPOSITE SCORE
-# ─────────────────────────────────────────────
-def weighted_vote(today_sigs, bt_results, action):
-    weights = {}
-    for name, bt in bt_results.items():
-        wr = bt.get("win_rate", 50) / 100
-        n = bt.get("trades", 0)
-        weights[name] = round(wr * min(n / 8.0, 1.0), 3)
-
-    total_w = sum(weights.values()) or 1e-9
-    target_v = 1 if action == "BUY" else -1
-    signal_w = sum(weights.get(n, 0) for n, v in today_sigs.items() if v == target_v)
-    return round(signal_w / total_w, 3), weights
-
-def composite_score(today_sigs, bt_results, ctx, regime_sc, action, p):
-    w_ratio, _ = weighted_vote(today_sigs, bt_results, action)
-    strat_pts = round(w_ratio * p["W_STRATEGY"], 2)
-
-    r = ctx.get("rsi")
-    if r is None:
-        rsi_pts = 0
-    elif action == "BUY":
-        rsi_pts = max(0, min((60 - r) / 40 * p["W_RSI"], p["W_RSI"]))
-    else:
-        rsi_pts = max(0, min((r - 40) / 40 * p["W_RSI"], p["W_RSI"]))
-
-    avg_volume = ctx.get("avg_volume") or 0
-    volume = ctx.get("volume") or 0
-    vol_ratio = (volume / avg_volume) if avg_volume > 0 else 1.0
-    vol_pts = min(vol_ratio / 2.0 * p["W_VOLUME"], p["W_VOLUME"])
-
-    reward_pct = ctx.get("reward_pct") or 0
-    risk_pct = ctx.get("risk_pct") or 0
-    rr = (reward_pct / risk_pct) if risk_pct > 0 else 0
-    rr_pts = min(rr / 3.0 * p["W_RR"], p["W_RR"])
-
-    reg_pts = regime_sc * p["W_REGIME"] if action == "BUY" else (1 - regime_sc) * p["W_REGIME"]
-
-    total = round(strat_pts + rsi_pts + vol_pts + rr_pts + reg_pts, 1)
-    breakdown = dict(
-        strategy=round(strat_pts, 1),
-        rsi=round(rsi_pts, 1),
-        volume=round(vol_pts, 1),
-        rr=round(rr_pts, 1),
-        regime=round(reg_pts, 1),
-    )
-    return min(total, 100.0), breakdown
-
-def score_label(s):
+def score_color(s):
+    s = safe_float(s)
     if s >= 80:
-        return "Very Strong"
+        return "#00c853"
     if s >= 65:
-        return "Strong"
+        return "#69f0ae"
     if s >= 50:
-        return "Good"
+        return "#ffeb3b"
     if s >= 35:
-        return "Moderate"
-    return "Weak"
+        return "#ffa726"
+    return "#ef5350"
+
+def status_badge(label, kind="neutral"):
+    palette = {
+        "buy": "#26a69a",
+        "sell": "#ef5350",
+        "champion": "#ffd54f",
+        "challenger": "#90caf9",
+        "candidate": "#c5e1a5",
+        "retired": "#e0e0e0",
+        "bullish": "#a5d6a7",
+        "bearish": "#ef9a9a",
+        "neutral": "#eeeeee",
+    }
+    bg = palette.get(kind, "#eeeeee")
+    return (
+        f'<span style="background:{bg};color:#111;padding:3px 10px;'
+        f'border-radius:12px;font-weight:700;font-size:0.95em">{label}</span>'
+    )
+
+def score_badge(s, label):
+    col = score_color(s)
+    return (
+        f'<span style="background:{col};color:#111;padding:3px 10px;'
+        f'border-radius:12px;font-weight:700;font-size:1.05em">{safe_float(s):.0f} — {label}</span>'
+    )
 
 # ─────────────────────────────────────────────
-#  DATA & CONTEXT
+#  DATA HELPERS
 # ─────────────────────────────────────────────
-def fetch(ticker, days=430):
+@st.cache_data(ttl=300)
+def load_recs(target_date=None, days_back=None):
+    q = sb.table("recommendations").select("*").order("composite_score", desc=True)
+    if target_date:
+        q = q.eq("date", target_date)
+    elif days_back:
+        q = q.gte("date", (date.today() - timedelta(days=days_back)).isoformat())
+
+    res = q.execute()
+    if not res.data:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(res.data)
+
+    for col in ["signals", "backtest", "score_breakdown", "strategy_weights"]:
+        if col in df.columns:
+            df[col] = df[col].apply(lambda x: json.loads(x) if isinstance(x, str) else (x or {}))
+
+    numeric_cols = [
+        "price", "change_1d", "change_5d", "rsi", "stop_loss", "target", "risk_pct",
+        "reward_pct", "win_rate", "avg_return", "median_return", "profit_factor",
+        "max_drawdown", "composite_score", "weighted_score_val", "raw_score", "avg_trades"
+    ]
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    return df
+
+@st.cache_data(ttl=60)
+def load_portfolio():
+    res = sb.table("paper_portfolio").select("*").order("buy_date", desc=True).execute()
+    return pd.DataFrame(res.data) if res.data else pd.DataFrame()
+
+@st.cache_data(ttl=90)
+def live_price(ticker):
+    try:
+        df = yf.download(ticker + ".NS", period="3d", progress=False, auto_adjust=True)
+        return float(df["Close"].iloc[-1]) if not df.empty else 0.0
+    except Exception:
+        return 0.0
+
+@st.cache_data(ttl=600)
+def price_history(ticker, days=90):
     try:
         df = yf.download(
             ticker + ".NS",
-            start=datetime.today() - timedelta(days=days),
-            end=datetime.today(),
+            start=date.today() - timedelta(days=days),
+            end=date.today(),
             progress=False,
             auto_adjust=True
         )
-        if df.empty or len(df) < 80:
-            return None, "insufficient_data"
+        if df.empty:
+            return pd.DataFrame()
         df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
-        return df[["Open", "High", "Low", "Close", "Volume"]].dropna(), "ok"
-    except Exception as e:
-        return None, str(e)[:120]
-
-def context(df, p):
-    c = df.Close
-    if len(c) < 20:
-        return sanitize_for_json({
-            "price": None,
-            "change_1d": None,
-            "change_5d": None,
-            "rsi": None,
-            "macd_hist": None,
-            "ema_bullish": None,
-            "supertrend_up": None,
-            "supertrend_line": None,
-            "support": None,
-            "resistance": None,
-            "stop_loss": None,
-            "target": None,
-            "risk_pct": None,
-            "reward_pct": None,
-            "volume": 0,
-            "avg_volume": 0,
-        })
-
-    r = float(rsi(c, p["RSI_PERIOD"]).iloc[-1])
-    _, _, hist = macd(c, p["MACD_FAST"], p["MACD_SLOW"], p["MACD_SIGNAL"])
-    e_s = float(ema(c, p["EMA_SHORT"]).iloc[-1])
-    e_l = float(ema(c, p["EMA_LONG"]).iloc[-1])
-    trend, st_line = supertrend(df.High, df.Low, c, p["ATR_PERIOD"], p["SUPERTREND_MULT"])
-    price = float(c.iloc[-1])
-    atr_now = float(atr(df.High, df.Low, c, p["ATR_PERIOD"]).iloc[-1])
-
-    prev_1 = float(c.iloc[-2]) if len(c) >= 2 and pd.notna(c.iloc[-2]) else None
-    prev_5 = float(c.iloc[-6]) if len(c) >= 6 and pd.notna(c.iloc[-6]) else None
-
-    sl = round(price - 1.5 * atr_now, 2) if math.isfinite(price) and math.isfinite(atr_now) else None
-    tgt = round(price + 3.0 * atr_now, 2) if math.isfinite(price) and math.isfinite(atr_now) else None
-
-    low20 = df.Low.rolling(20).min().iloc[-1]
-    high20 = df.High.rolling(20).max().iloc[-1]
-    vol20 = df.Volume.rolling(20).mean().iloc[-1]
-
-    out = dict(
-        price=round(price, 2) if math.isfinite(price) else None,
-        change_1d=round((price - prev_1) / prev_1 * 100, 2) if prev_1 not in [None, 0] and math.isfinite(prev_1) else None,
-        change_5d=round((price - prev_5) / prev_5 * 100, 2) if prev_5 not in [None, 0] and math.isfinite(prev_5) else None,
-        rsi=round(r, 1) if math.isfinite(r) else None,
-        macd_hist=round(float(hist.iloc[-1]), 3) if pd.notna(hist.iloc[-1]) and math.isfinite(float(hist.iloc[-1])) else None,
-        ema_bullish=bool(e_s > e_l) if math.isfinite(e_s) and math.isfinite(e_l) else None,
-        supertrend_up=bool(trend.iloc[-1] == 1) if pd.notna(trend.iloc[-1]) else None,
-        supertrend_line=round(float(st_line.iloc[-1]), 2) if pd.notna(st_line.iloc[-1]) and math.isfinite(float(st_line.iloc[-1])) else None,
-        support=round(float(low20), 2) if pd.notna(low20) and math.isfinite(float(low20)) else None,
-        resistance=round(float(high20), 2) if pd.notna(high20) and math.isfinite(float(high20)) else None,
-        stop_loss=sl,
-        target=tgt,
-        risk_pct=round((price - sl) / price * 100, 2) if sl is not None and price not in [None, 0] and math.isfinite(price) else None,
-        reward_pct=round((tgt - price) / price * 100, 2) if tgt is not None and price not in [None, 0] and math.isfinite(price) else None,
-        volume=int(df.Volume.iloc[-1]) if pd.notna(df.Volume.iloc[-1]) else 0,
-        avg_volume=int(vol20) if pd.notna(vol20) and math.isfinite(float(vol20)) else 0,
-    )
-    return sanitize_for_json(out)
-
-def market_regime(p):
-    try:
-        df = yf.download("^NSEI", period="120d", progress=False, auto_adjust=True)
-        if df.empty or len(df) < 55:
-            return "UNKNOWN", 0.5
-        close = df["Close"].squeeze()
-        e50 = float(ema(close, 50).iloc[-1])
-        e20 = float(ema(close, 20).iloc[-1])
-        r = float(rsi(close, p["RSI_PERIOD"]).iloc[-1])
-        price = float(close.iloc[-1])
-
-        if price > e20 > e50 and r > 50:
-            return "BULLISH", 1.0
-        if price < e20 < e50 and r < 50:
-            return "BEARISH", 0.0
-        return "NEUTRAL", 0.5
+        return df[["Open", "High", "Low", "Close", "Volume"]].dropna()
     except Exception:
-        return "UNKNOWN", 0.5
+        return pd.DataFrame()
+
+@st.cache_data(ttl=120)
+def get_meta():
+    res = sb.table("agent_meta").select("*").eq("id", 1).execute()
+    return res.data[0] if res.data else {}
+
+@st.cache_data(ttl=120)
+def load_agent_params(status=None):
+    q = sb.table("agent_params").select("*").order("version", desc=True)
+    if status:
+        q = q.eq("status", status)
+    res = q.execute()
+    return pd.DataFrame(res.data) if res.data else pd.DataFrame()
+
+@st.cache_data(ttl=120)
+def load_opt_runs():
+    res = sb.table("optimization_runs").select("*").order("run_date", desc=True).execute()
+    return pd.DataFrame(res.data) if res.data else pd.DataFrame()
 
 # ─────────────────────────────────────────────
-#  MAIN
+#  ACTION HELPERS
 # ─────────────────────────────────────────────
-def run():
-    today = datetime.today().strftime("%Y-%m-%d")
-    print(f"\n🇮🇳 Indian Stock Agent v4 — {today}")
+def paper_buy(ticker, price, qty, sl, tgt, notes, rec_id=None):
+    sb.table("paper_portfolio").insert({
+        "ticker": ticker,
+        "buy_date": date.today().isoformat(),
+        "buy_price": price,
+        "quantity": qty,
+        "entry_stop_loss": sl,
+        "entry_target": tgt,
+        "status": "OPEN",
+        "notes": notes,
+        "recommendation_id": rec_id,
+    }).execute()
+    st.cache_data.clear()
 
-    P, param_version = load_active_params()
-    print(f"   Params: {param_version}")
-    print(f"   Scanning {len(ALL_TICKERS)} NSE stocks...\n")
+def paper_sell(trade_id, sell_price, buy_price, qty, exit_reason="manual"):
+    pnl_pct = round((sell_price - buy_price) / buy_price * 100, 2) if buy_price else 0
+    pnl_inr = round((sell_price - buy_price) * qty, 2)
+    sb.table("paper_portfolio").update({
+        "sell_date": date.today().isoformat(),
+        "sell_price": sell_price,
+        "status": "CLOSED",
+        "pnl_pct": pnl_pct,
+        "pnl_inr": pnl_inr,
+        "exit_reason": exit_reason,
+    }).eq("id", trade_id).execute()
+    st.cache_data.clear()
 
-    STRATEGIES = get_strategies(P)
+def promote_param(version, new_status):
+    if new_status == "champion":
+        sb.table("agent_params").update({"status": "retired"}).eq("status", "champion").execute()
+        sb.table("agent_params").update({"status": "retired"}).eq("status", "challenger").execute()
+    elif new_status == "challenger":
+        sb.table("agent_params").update({"status": "retired"}).eq("status", "challenger").execute()
 
-    print("   Checking NIFTY market regime...")
-    regime_label, regime_sc = market_regime(P)
-    print(f"   Regime: {regime_label}  (score={regime_sc})\n")
+    sb.table("agent_params").update({
+        "status": new_status,
+        "promoted_at": date.today().isoformat(),
+    }).eq("version", version).execute()
+    st.cache_data.clear()
 
-    supabase.table("recommendations").delete().eq("date", today).execute()
-    supabase.table("ticker_run_log").delete().eq("date", today).execute()
+# ─────────────────────────────────────────────
+#  CHARTS / ANALYTICS
+# ─────────────────────────────────────────────
+def candlestick(df, ticker, buy_price=None, sl=None, tgt=None):
+    df = df.copy()
+    df["ema9"] = df.Close.ewm(span=9, adjust=False).mean()
+    df["ema21"] = df.Close.ewm(span=21, adjust=False).mean()
 
-    records, run_logs = [], []
-    gate_counts = {"fetched": 0, "any_signal": 0, "passed_weight": 0}
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(
+        x=df.index, open=df.Open, high=df.High, low=df.Low, close=df.Close,
+        name=ticker, increasing_line_color="#26a69a", decreasing_line_color="#ef5350"
+    ))
+    fig.add_trace(go.Scatter(x=df.index, y=df.ema9, name="EMA 9", line=dict(color="#ffb300", width=1.2)))
+    fig.add_trace(go.Scatter(x=df.index, y=df.ema21, name="EMA 21", line=dict(color="#ab47bc", width=1.2)))
 
-    for i, ticker in enumerate(ALL_TICKERS, 1):
-        sys.stdout.write(f"\r  {i}/{len(ALL_TICKERS)}  {ticker:<15}")
-        sys.stdout.flush()
+    if buy_price:
+        fig.add_hline(y=buy_price, line_color="#00e676", line_dash="dash", annotation_text=f"Buy ₹{buy_price:.2f}")
+    if sl:
+        fig.add_hline(y=sl, line_color="#ef5350", line_dash="dot", annotation_text=f"SL ₹{sl:.2f}")
+    if tgt:
+        fig.add_hline(y=tgt, line_color="#69f0ae", line_dash="dot", annotation_text=f"Tgt ₹{tgt:.2f}")
 
-        df, status = fetch(ticker)
-        run_logs.append(sanitize_for_json(dict(date=today, ticker=ticker, status=status)))
-        if df is None:
+    fig.update_layout(
+        height=360,
+        xaxis_rangeslider_visible=False,
+        margin=dict(t=10, b=10, l=0, r=0),
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+        legend=dict(orientation="h", y=1.02),
+    )
+    return fig
+
+def check_exit_alerts(port):
+    alerts = []
+    if port.empty:
+        return alerts
+
+    for _, row in port[port.status == "OPEN"].iterrows():
+        lp = live_price(row.ticker)
+        if lp <= 0:
             continue
-        gate_counts["fetched"] += 1
 
+        sl = row.get("entry_stop_loss")
+        tgt = row.get("entry_target")
+
+        if sl and lp <= float(sl):
+            alerts.append({
+                "ticker": row.ticker,
+                "type": "SL_HIT",
+                "lp": lp,
+                "level": sl,
+                "pnl": round((lp - row.buy_price) / row.buy_price * 100, 2) if row.buy_price else 0,
+                "id": row.id,
+                "buy_price": row.buy_price,
+                "qty": row.quantity,
+            })
+        elif tgt and lp >= float(tgt):
+            alerts.append({
+                "ticker": row.ticker,
+                "type": "TARGET_HIT",
+                "lp": lp,
+                "level": tgt,
+                "pnl": round((lp - row.buy_price) / row.buy_price * 100, 2) if row.buy_price else 0,
+                "id": row.id,
+                "buy_price": row.buy_price,
+                "qty": row.quantity,
+            })
+
+    return alerts
+
+def compute_portfolio_snapshot(port):
+    if port.empty:
+        return {
+            "open_pos": pd.DataFrame(),
+            "closed_pos": pd.DataFrame(),
+            "total_inv": 0.0,
+            "total_cur": 0.0,
+            "open_pnl": 0.0,
+            "closed_pnl": 0.0,
+            "win_ct": 0,
+            "win_rate": 0.0,
+        }
+
+    open_pos = port[port.status == "OPEN"].copy() if "status" in port.columns else pd.DataFrame()
+    closed_pos = port[port.status == "CLOSED"].copy() if "status" in port.columns else pd.DataFrame()
+
+    total_inv = 0.0
+    total_cur = 0.0
+
+    if not open_pos.empty:
+        for _, row in open_pos.iterrows():
+            lp = live_price(row.ticker)
+            total_inv += safe_float(row.buy_price) * safe_float(row.quantity)
+            total_cur += (lp if lp > 0 else safe_float(row.buy_price)) * safe_float(row.quantity)
+
+    open_pnl = total_cur - total_inv
+    closed_pnl = float(closed_pos.pnl_inr.sum()) if (not closed_pos.empty and "pnl_inr" in closed_pos.columns) else 0.0
+    win_ct = len(closed_pos[closed_pos.pnl_pct > 0]) if (not closed_pos.empty and "pnl_pct" in closed_pos.columns) else 0
+    win_rate = (win_ct / len(closed_pos) * 100) if not closed_pos.empty else 0.0
+
+    return {
+        "open_pos": open_pos,
+        "closed_pos": closed_pos,
+        "total_inv": total_inv,
+        "total_cur": total_cur,
+        "open_pnl": open_pnl,
+        "closed_pnl": closed_pnl,
+        "win_ct": win_ct,
+        "win_rate": win_rate,
+    }
+
+# ─────────────────────────────────────────────
+#  SIDEBAR
+# ─────────────────────────────────────────────
+with st.sidebar:
+    st.title("🇮🇳 Stock Agent")
+    meta = get_meta()
+
+    if meta:
+        st.success(f"Last run: **{meta.get('last_run', 'N/A')}**")
+        regime = meta.get("market_regime", "?")
+        emoji = {"BULLISH": "🟢", "BEARISH": "🔴", "NEUTRAL": "🟡"}.get(regime, "⬜")
+        st.caption(f"Market: {emoji} **{regime}**  |  Signals: {meta.get('total_signals', 0)}")
+        st.caption(f"Params: {meta.get('active_param_version', 'defaults')}")
+    else:
+        st.warning("Agent hasn't run yet")
+
+    st.divider()
+
+    page = st.radio("Navigate", [
+        "📊 Today's Signals",
+        "💼 My Paper Portfolio",
+        "📅 Signal History",
+        "📈 Strategy Stats",
+        "🤖 Optimizer",
+    ])
+
+    st.divider()
+    st.caption("NSE: 9:15 AM – 3:30 PM IST")
+    st.caption("Agent: 7:00 AM IST, Mon–Fri")
+    st.caption("Optimizer: Sunday 11 PM IST")
+
+    if st.button("🔄 Refresh"):
+        st.cache_data.clear()
+        st.rerun()
+
+# ─────────────────────────────────────────────
+#  GLOBAL SNAPSHOT + ALERTS
+# ─────────────────────────────────────────────
+port_all = load_portfolio()
+portfolio_snapshot = compute_portfolio_snapshot(port_all)
+alerts = check_exit_alerts(port_all)
+
+for a in alerts:
+    if a["type"] == "SL_HIT":
+        st.error(
+            f"🚨 **STOP-LOSS HIT — {a['ticker']}** | Live: ₹{a['lp']:,.2f} ≤ "
+            f"SL: ₹{float(a['level']):,.2f} | P&L: {a['pnl']:+.2f}%"
+        )
+    else:
+        st.success(
+            f"🎯 **TARGET HIT — {a['ticker']}** | Live: ₹{a['lp']:,.2f} ≥ "
+            f"Target: ₹{float(a['level']):,.2f} | P&L: {a['pnl']:+.2f}%"
+        )
+
+# ─────────────────────────────────────────────
+#  PAGE: TODAY'S SIGNALS
+# ─────────────────────────────────────────────
+if page == "📊 Today's Signals":
+    today_str = date.today().isoformat()
+    st.title("📊 Today's Signals")
+    st.caption(f"{datetime.today().strftime('%A, %d %B %Y')}  |  Sorted & filterable")
+
+    recs = load_recs(target_date=today_str)
+    if recs.empty:
+        st.info("No signals today. Agent runs at 7:00 AM IST — trigger manually from GitHub Actions if needed.")
+        st.stop()
+
+    buys = recs[recs.action == "BUY"].copy()
+    sells = recs[recs.action == "SELL"].copy()
+
+    top1, top2, top3, top4, top5, top6 = st.columns(6)
+    top1.metric("Signals", len(recs))
+    top2.metric("Buys", len(buys))
+    top3.metric("Sells", len(sells))
+    top4.metric("Top Score", f"{safe_float(recs.composite_score.max()):.0f}/100")
+    top5.metric("Open P&L", f"₹{portfolio_snapshot['open_pnl']:+,.0f}")
+    top6.metric("Market", meta.get("market_regime", "?"))
+
+    with st.expander("🔧 Filters & Ranking", expanded=True):
+        f1, f2, f3, f4 = st.columns(4)
+        min_cs = f1.slider("Min Composite Score", 0, 100, 30)
+        min_wr = f2.slider("Min Win Rate %", 0, 100, 40)
+        min_pf = f3.slider("Min Profit Factor", 0.0, 5.0, 0.8, 0.1)
+        action_filter = f4.selectbox("Action", ["All", "BUY", "SELL"])
+
+        f5, f6, f7 = st.columns(3)
+        ticker_query = f5.text_input("Ticker search", "")
+        regime_filter = f6.selectbox("Market regime", ["All", "BULLISH", "NEUTRAL", "BEARISH", "UNKNOWN"])
+        sort_col = f7.selectbox(
+            "Sort by",
+            [
+                "composite_score", "win_rate", "profit_factor", "avg_return",
+                "rsi", "reward_pct", "risk_pct", "weighted_score_val"
+            ],
+            index=0
+        )
+
+        filtered = recs.copy()
+        filtered = filtered[
+            (filtered.composite_score.fillna(0) >= min_cs) &
+            (filtered.win_rate.fillna(0) >= min_wr) &
+            (filtered.profit_factor.fillna(0) >= min_pf)
+        ]
+
+        if action_filter != "All":
+            filtered = filtered[filtered.action == action_filter]
+
+        if ticker_query.strip():
+            filtered = filtered[filtered.ticker.astype(str).str.contains(ticker_query.strip(), case=False, na=False)]
+
+        if regime_filter != "All" and "market_regime" in filtered.columns:
+            filtered = filtered[filtered.market_regime == regime_filter]
+
+        ascending = True if sort_col in ["risk_pct", "rsi"] else False
+        if sort_col in filtered.columns:
+            filtered = filtered.sort_values(sort_col, ascending=ascending, na_position="last")
+
+    if filtered.empty:
+        st.warning("No signals match the selected filters.")
+        st.stop()
+
+    st.subheader("📋 Signal Leaderboard")
+    board = filtered.copy()
+    show_cols = [
+        "ticker", "action", "composite_score", "score_label", "win_rate",
+        "profit_factor", "avg_return", "rsi", "price", "stop_loss",
+        "target", "reward_pct", "risk_pct", "market_regime", "active_strategies"
+    ]
+    show_cols = [c for c in show_cols if c in board.columns]
+    board_show = board[show_cols].copy()
+
+    rename_map = {
+        "ticker": "Ticker",
+        "action": "Action",
+        "composite_score": "Score",
+        "score_label": "Label",
+        "win_rate": "Win Rate %",
+        "profit_factor": "PF",
+        "avg_return": "Avg Ret %",
+        "rsi": "RSI",
+        "price": "Price",
+        "stop_loss": "Stop Loss",
+        "target": "Target",
+        "reward_pct": "Reward %",
+        "risk_pct": "Risk %",
+        "market_regime": "Regime",
+        "active_strategies": "Strategies",
+    }
+    board_show = board_show.rename(columns=rename_map)
+    st.dataframe(
+        board_show,
+        use_container_width=True,
+        hide_index=True
+    )
+
+    chosen_ticker = st.selectbox("Open details for ticker", filtered["ticker"].tolist())
+    selected = filtered[filtered["ticker"] == chosen_ticker].iloc[0]
+
+    st.divider()
+    st.subheader(f"🔎 Signal Details — {selected.ticker}")
+
+    sig_c1, sig_c2 = st.columns([1.2, 1.0])
+    with sig_c1:
+        st.markdown(
+            status_badge(selected.action, "buy" if selected.action == "BUY" else "sell") + " " +
+            score_badge(selected.composite_score, selected.score_label),
+            unsafe_allow_html=True
+        )
+        if bool(selected.get("low_sample_warning", False)):
+            st.warning("⚠️ Fewer than 5 backtest trades — treat win rate cautiously.")
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Price", fmt_inr(selected.get("price")))
+        m1.metric("1D", fmt_pct(selected.get("change_1d")))
+        m1.metric("5D", fmt_pct(selected.get("change_5d")))
+        m2.metric("RSI", fmt_num(selected.get("rsi"), 1))
+        m2.metric("WR", fmt_pct(selected.get("win_rate"), 1, signed=False))
+        m2.metric("PF", fmt_num(selected.get("profit_factor"), 2))
+        m3.metric("Stop Loss", fmt_inr(selected.get("stop_loss")))
+        m3.metric("Target", fmt_inr(selected.get("target")))
+        m3.metric("Reward", fmt_pct(selected.get("reward_pct")))
+        m4.metric("Risk", fmt_pct(selected.get("risk_pct")))
+        m4.metric("Avg Return", fmt_pct(selected.get("avg_return")))
+        m4.metric("Median Return", fmt_pct(selected.get("median_return")))
+
+        st.caption(f"Strategies: {selected.get('active_strategies', '—')}")
+        st.caption(f"Market Regime: {selected.get('market_regime', '—')}  |  Params: {selected.get('param_version', '—')}")
+
+        bd = selected.get("score_breakdown", {}) or {}
+        if bd:
+            bd_df = pd.DataFrame([
+                {"Component": "Strategy", "Score": bd.get("strategy", 0), "Max": 40},
+                {"Component": "RSI", "Score": bd.get("rsi", 0), "Max": 20},
+                {"Component": "Volume", "Score": bd.get("volume", 0), "Max": 15},
+                {"Component": "R:R", "Score": bd.get("rr", 0), "Max": 15},
+                {"Component": "Regime", "Score": bd.get("regime", 0), "Max": 10},
+            ])
+            bd_df["pct"] = (bd_df["Score"] / bd_df["Max"] * 100).clip(0, 100)
+            fig_bd = px.bar(
+                bd_df, x="Score", y="Component", orientation="h", text="Score",
+                color="pct", color_continuous_scale="RdYlGn", range_color=[0, 100]
+            )
+            fig_bd.update_layout(
+                height=220,
+                margin=dict(t=10, b=10, l=0, r=0),
+                coloraxis_showscale=False,
+                plot_bgcolor="rgba(0,0,0,0)",
+                paper_bgcolor="rgba(0,0,0,0)",
+            )
+            fig_bd.update_traces(texttemplate="%{text:.1f}", textposition="inside")
+            st.plotly_chart(fig_bd, use_container_width=True)
+
+    with sig_c2:
+        hist_df = price_history(selected.ticker, 90)
+        if not hist_df.empty:
+            st.plotly_chart(
+                candlestick(
+                    hist_df,
+                    selected.ticker,
+                    sl=safe_float(selected.get("stop_loss"), None),
+                    tgt=safe_float(selected.get("target"), None)
+                ),
+                use_container_width=True
+            )
+        else:
+            st.info("Price chart unavailable.")
+
+    st.subheader("🧠 Strategy Breakdown")
+    sigs = selected.get("signals", {}) or {}
+    bts = selected.get("backtest", {}) or {}
+    wts = selected.get("strategy_weights", {}) or {}
+    strat_rows = []
+    for name, val in sigs.items():
+        b = bts.get(name, {})
+        strat_rows.append({
+            "Strategy": name,
+            "Signal": "BUY" if val == 1 else ("SELL" if val == -1 else "None"),
+            "Weight": safe_float(wts.get(name, 0)),
+            "Win Rate %": safe_float(b.get("win_rate", 0)),
+            "Avg Return %": safe_float(b.get("avg_return", 0)),
+            "Median Return %": safe_float(b.get("median_return", 0)),
+            "Profit Factor": safe_float(b.get("profit_factor", 0)),
+            "Trades": safe_int(b.get("trades", 0)),
+            "SL Exits": safe_int(b.get("sl_exits", 0)),
+            "Target Exits": safe_int(b.get("target_exits", 0)),
+        })
+    st.dataframe(pd.DataFrame(strat_rows), use_container_width=True, hide_index=True)
+
+    st.subheader("📝 Paper Trade")
+    pb1, pb2, pb3, pb4 = st.columns(4)
+    qty = pb1.number_input("Qty", min_value=1, value=10, key=f"qty_{selected.ticker}")
+    price = pb2.number_input("Price (₹)", value=safe_float(selected.get("price"), 0.0), key=f"px_{selected.ticker}")
+    sl_in = pb3.number_input("Stop Loss (₹)", value=safe_float(selected.get("stop_loss"), 0.0), key=f"sl_{selected.ticker}")
+    tg_in = pb4.number_input("Target (₹)", value=safe_float(selected.get("target"), 0.0), key=f"tg_{selected.ticker}")
+    notes = st.text_input("Notes", value=str(selected.get("active_strategies", "")), key=f"nt_{selected.ticker}")
+    if st.button(f"🟢 Paper Buy {selected.ticker}", key=f"buy_{selected.ticker}"):
+        paper_buy(selected.ticker, price, qty, sl_in, tg_in, notes, str(selected.get("id", "")))
+        st.success(f"✅ Paper bought {qty} × {selected.ticker} @ ₹{price:.2f}")
+        st.balloons()
+
+# ─────────────────────────────────────────────
+#  PAGE: PAPER PORTFOLIO
+# ─────────────────────────────────────────────
+elif page == "💼 My Paper Portfolio":
+    st.title("💼 My Paper Portfolio")
+
+    open_pos = portfolio_snapshot["open_pos"]
+    closed_pos = portfolio_snapshot["closed_pos"]
+    total_inv = portfolio_snapshot["total_inv"]
+    open_pnl = portfolio_snapshot["open_pnl"]
+    closed_pnl = portfolio_snapshot["closed_pnl"]
+    win_ct = portfolio_snapshot["win_ct"]
+    win_rate = portfolio_snapshot["win_rate"]
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Open Positions", len(open_pos))
+    c2.metric("Open P&L", f"₹{open_pnl:+,.0f}", delta=f"{open_pnl / total_inv * 100:+.1f}%" if total_inv else "–")
+    c3.metric("Realised P&L", f"₹{closed_pnl:+,.0f}")
+    c4.metric("Total P&L", f"₹{open_pnl + closed_pnl:+,.0f}")
+    c5.metric("Win Rate", f"{win_rate:.0f}%", delta=f"{win_ct}/{len(closed_pos)}" if len(closed_pos) else "0/0")
+
+    st.divider()
+    st.subheader("📂 Open Positions")
+    if alerts:
+        st.warning(f"⚠️ {len(alerts)} position(s) need attention — see alerts above!")
+
+    if open_pos.empty:
+        st.info("No open positions.")
+    else:
+        for _, row in open_pos.iterrows():
+            lp = live_price(row.ticker)
+            if lp > 0:
+                pnl_pct = (lp - row.buy_price) / row.buy_price * 100 if row.buy_price else 0
+                pnl_inr = (lp - row.buy_price) * row.quantity
+            else:
+                lp = row.buy_price
+                pnl_pct = 0
+                pnl_inr = 0
+
+            sl = safe_float(row.get("entry_stop_loss"), 0)
+            tgt = safe_float(row.get("entry_target"), 0)
+            sl_hit = sl > 0 and lp <= sl
+            tgt_hit = tgt > 0 and lp >= tgt
+            icon = "🚨" if sl_hit else ("🎯" if tgt_hit else ("🟢" if pnl_pct >= 0 else "🔴"))
+
+            with st.expander(
+                f"{icon} **{row.ticker}** | {safe_int(row.quantity)} shares | "
+                f"Buy ₹{safe_float(row.buy_price):,.2f} → Live ₹{lp:,.2f} | P&L {pnl_pct:+.2f}%",
+                expanded=sl_hit or tgt_hit
+            ):
+                if sl_hit:
+                    st.error(f"🚨 Stop-loss breached! ₹{lp:,.2f} ≤ SL ₹{sl:,.2f}")
+                if tgt_hit:
+                    st.success(f"🎯 Target hit! ₹{lp:,.2f} ≥ Target ₹{tgt:,.2f}")
+
+                pc1, pc2, pc3 = st.columns(3)
+                pc1.metric("Buy Price", fmt_inr(row.buy_price))
+                pc1.metric("Buy Date", str(row.buy_date))
+                pc2.metric("Live Price", fmt_inr(lp))
+                pc2.metric("Stop Loss", fmt_inr(sl) if sl else "Not set")
+                pc2.metric("Target", fmt_inr(tgt) if tgt else "Not set")
+                pc3.metric("P&L %", fmt_pct(pnl_pct))
+                pc3.metric("P&L ₹", f"₹{pnl_inr:+,.0f}")
+
+                hist_df = price_history(row.ticker, 60)
+                if not hist_df.empty:
+                    st.plotly_chart(
+                        candlestick(hist_df, row.ticker, buy_price=row.buy_price, sl=sl or None, tgt=tgt or None),
+                        use_container_width=True
+                    )
+
+                s1, s2, s3 = st.columns(3)
+                sell_px = s1.number_input("Sell Price (₹)", value=float(lp), key=f"spx_{row.id}")
+                er = s2.selectbox("Exit Reason", ["manual", "sl_hit", "target_hit", "other"], key=f"er_{row.id}")
+                if s3.button(f"🔴 Sell {row.ticker}", key=f"sell_{row.id}"):
+                    paper_sell(row.id, sell_px, row.buy_price, row.quantity, er)
+                    st.success(f"✅ Closed {row.ticker} @ ₹{sell_px:.2f}")
+                    st.rerun()
+
+    st.divider()
+    st.subheader("✅ Closed Trades")
+    if closed_pos.empty:
+        st.info("No closed trades yet.")
+    else:
+        cs2 = closed_pos.sort_values("sell_date").copy()
+        cs2["cum_pnl"] = cs2.pnl_inr.cumsum()
+
+        fig_eq = go.Figure()
+        fig_eq.add_trace(go.Scatter(
+            x=cs2.sell_date, y=cs2.cum_pnl,
+            fill="tozeroy", line=dict(color="#26a69a"), name="Cumulative P&L"
+        ))
+        fig_eq.add_hline(y=0, line_color="#ef5350", line_dash="dash")
+        fig_eq.update_layout(
+            height=260, margin=dict(t=10, b=10, l=0, r=0), title="Cumulative P&L (₹)",
+            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)"
+        )
+        st.plotly_chart(fig_eq, use_container_width=True)
+
+        disp = closed_pos[[
+            "ticker", "buy_date", "sell_date", "buy_price", "sell_price",
+            "quantity", "pnl_pct", "pnl_inr", "exit_reason"
+        ]].copy()
+        disp.columns = ["Ticker", "Buy Date", "Sell Date", "Buy ₹", "Sell ₹", "Qty", "P&L %", "P&L ₹", "Exit"]
+        st.dataframe(disp, use_container_width=True, hide_index=True)
+
+# ─────────────────────────────────────────────
+#  PAGE: SIGNAL HISTORY
+# ─────────────────────────────────────────────
+elif page == "📅 Signal History":
+    st.title("📅 Signal History")
+    days_back = st.slider("Past N days", 7, 60, 14)
+    hist = load_recs(days_back=days_back)
+    if hist.empty:
+        st.info("No history yet.")
+        st.stop()
+
+    act_f = st.selectbox("Action filter", ["All", "BUY", "SELL"])
+    if act_f != "All":
+        hist = hist[hist.action == act_f]
+
+    daily = hist.groupby(["date", "action"]).size().reset_index(name="count")
+    fig = px.bar(
+        daily, x="date", y="count", color="action",
+        color_discrete_map={"BUY": "#26a69a", "SELL": "#ef5350"},
+        title="Daily signal count"
+    )
+    fig.update_layout(
+        height=250, margin=dict(t=30, b=10, l=0, r=0),
+        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)"
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    fig2 = px.scatter(
+        hist, x="date", y="composite_score", color="action",
+        color_discrete_map={"BUY": "#26a69a", "SELL": "#ef5350"},
+        hover_data=["ticker", "score_label"], title="Composite score distribution"
+    )
+    fig2.update_layout(
+        height=250, margin=dict(t=30, b=10, l=0, r=0),
+        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)"
+    )
+    st.plotly_chart(fig2, use_container_width=True)
+
+    show_cols = [
+        "date", "ticker", "action", "composite_score", "score_label",
+        "win_rate", "avg_return", "median_return", "profit_factor",
+        "rsi", "active_strategies", "market_regime", "param_version"
+    ]
+    show_cols = [c for c in show_cols if c in hist.columns]
+    st.dataframe(hist[show_cols], use_container_width=True, hide_index=True)
+
+# ─────────────────────────────────────────────
+#  PAGE: STRATEGY STATS
+# ─────────────────────────────────────────────
+elif page == "📈 Strategy Stats":
+    st.title("📈 Strategy Performance Stats")
+    st.caption("Historical strategy stats can mix old and new live strategy sets. Use the filter below to focus on current live strategies.")
+
+    res = sb.table("recommendations").select(
+        "ticker,backtest,action,win_rate,avg_return,composite_score,profit_factor,max_drawdown,median_return,date,param_version"
+    ).execute()
+    all_recs = pd.DataFrame(res.data) if res.data else pd.DataFrame()
+
+    if all_recs.empty:
+        st.info("No data yet.")
+        st.stop()
+
+    current_live_strategies = [
+        "EMA Crossover",
+        "RSI + MACD",
+        "Bollinger",
+        "Donchian",
+        "Volume Breakout",
+        "RSI Trend Shift",
+    ]
+
+    f1, f2 = st.columns(2)
+    strategy_mode = f1.selectbox(
+        "Strategy view",
+        ["Current live strategies only", "All historical strategies"],
+        index=0
+    )
+    days_back = f2.slider("History window (days)", 7, 180, 60)
+
+    if "date" in all_recs.columns:
+        cutoff = (date.today() - timedelta(days=days_back)).isoformat()
+        all_recs = all_recs[all_recs["date"] >= cutoff].copy()
+
+    rows = []
+    for _, r in all_recs.iterrows():
         try:
-            today_sigs = {name: int(fn(df).iloc[-1]) for name, fn in STRATEGIES.items()}
-            buy_count = sum(1 for v in today_sigs.values() if v == 1)
-            sell_count = sum(1 for v in today_sigs.values() if v == -1)
+            bt = json.loads(r.backtest) if isinstance(r.backtest, str) else r.backtest
+            for name, stats in bt.items():
+                if strategy_mode == "Current live strategies only" and name not in current_live_strategies:
+                    continue
 
-            if buy_count == 0 and sell_count == 0:
-                continue
-            gate_counts["any_signal"] += 1
+                rows.append({
+                    "Strategy": name,
+                    "Win Rate": stats.get("win_rate", 0),
+                    "Avg Return": stats.get("avg_return", 0),
+                    "Median Return": stats.get("median_return", 0),
+                    "Profit Factor": stats.get("profit_factor", 0),
+                    "Max Drawdown": stats.get("max_drawdown", 0),
+                    "SL Exits": stats.get("sl_exits", 0),
+                    "Target Exits": stats.get("target_exits", 0),
+                    "Trades": stats.get("trades", 0),
+                })
+        except Exception:
+            continue
 
-            bt = {name: backtest(df, fn(df), P) for name, fn in STRATEGIES.items()}
-            action = "BUY" if buy_count >= sell_count else "SELL"
-            w_ratio, weights = weighted_vote(today_sigs, bt, action)
+    if not rows:
+        st.info("No backtest data yet for the selected filter.")
+        st.stop()
 
-            if w_ratio < P["MIN_WEIGHTED_SCORE"]:
-                continue
-            gate_counts["passed_weight"] += 1
+    bt_df = pd.DataFrame(rows)
+    agg = bt_df.groupby("Strategy").agg(
+        Win_Rate=("Win Rate", "mean"),
+        Avg_Return=("Avg Return", "mean"),
+        Median_Return=("Median Return", "mean"),
+        Profit_Factor=("Profit Factor", "mean"),
+        Max_Drawdown=("Max Drawdown", "mean"),
+        Total_Trades=("Trades", "sum"),
+        SL_Exits=("SL Exits", "sum"),
+        Target_Exits=("Target Exits", "sum"),
+    ).reset_index()
 
-            ctx = context(df, P)
-            c_score, c_breakdown = composite_score(today_sigs, bt, ctx, regime_sc, action, P)
+    if strategy_mode == "Current live strategies only":
+        st.success("Showing only the current live strategy basket: EMA Crossover, RSI + MACD, Bollinger.")
+    else:
+        st.warning("Showing all historical strategies. Results may include old strategies from previous agent versions.")
 
-            active = [
-                n for n, v in today_sigs.items()
-                if (v == 1 and action == "BUY") or (v == -1 and action == "SELL")
-            ]
+    for _, row in agg.iterrows():
+        if row.Total_Trades < 20:
+            st.warning(f"⚠️ **{row.Strategy}**: only {int(row.Total_Trades)} trades — interpret cautiously.")
 
-            agg = lambda k: round(float(np.mean([bt[n][k] for n in active])), 2) if active else 0
-            low_smp = int(np.mean([bt[n]["trades"] for n in active])) < 5 if active else True
+    c1, c2 = st.columns(2)
 
-            record = dict(
-                date=today,
-                ticker=ticker,
-                action=action,
-                score=int(round(float(c_score))) if c_score is not None else 0,
-                raw_score=int(buy_count if action == "BUY" else sell_count),
-                weighted_score_val=float(w_ratio) if w_ratio is not None else 0.0,
-                composite_score=float(c_score) if c_score is not None else 0.0,
-                score_label=score_label(c_score if c_score is not None else 0),
-                score_breakdown=json.dumps(sanitize_for_json(c_breakdown)),
-                signals=json.dumps(sanitize_for_json(today_sigs)),
-                strategy_weights=json.dumps(sanitize_for_json(weights)),
-                backtest=json.dumps(sanitize_for_json(bt)),
-                active_strategies=", ".join(active),
-                low_sample_warning=bool(low_smp),
-                win_rate=float(agg("win_rate")) if active else 0.0,
-                avg_return=float(agg("avg_return")) if active else 0.0,
-                median_return=float(agg("median_return")) if active else 0.0,
-                profit_factor=float(agg("profit_factor")) if active else 0.0,
-                max_drawdown=float(agg("max_drawdown")) if active else 0.0,
-                avg_trades=int(round(np.mean([bt[n]["trades"] for n in active]))) if active else 0,
-                market_regime=regime_label,
-                param_version=param_version,
-                **ctx,
+    with c1:
+        fig = px.bar(
+            agg,
+            x="Strategy",
+            y="Win_Rate",
+            color="Win_Rate",
+            color_continuous_scale="teal",
+            text="Win_Rate",
+            title="Win Rate %"
+        )
+        fig.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
+        fig.update_layout(
+            height=300,
+            showlegend=False,
+            plot_bgcolor="rgba(0,0,0,0)",
+            paper_bgcolor="rgba(0,0,0,0)"
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    with c2:
+        fig2 = px.bar(
+            agg,
+            x="Strategy",
+            y="Profit_Factor",
+            color="Profit_Factor",
+            color_continuous_scale="RdYlGn",
+            text="Profit_Factor",
+            title="Profit Factor (>1 = profitable)"
+        )
+        fig2.add_hline(y=1.0, line_dash="dash", line_color="#ef5350")
+        fig2.update_traces(texttemplate="%{text:.2f}", textposition="outside")
+        fig2.update_layout(
+            height=300,
+            showlegend=False,
+            plot_bgcolor="rgba(0,0,0,0)",
+            paper_bgcolor="rgba(0,0,0,0)"
+        )
+        st.plotly_chart(fig2, use_container_width=True)
+
+    st.dataframe(
+        agg.style.format({
+            "Win_Rate": "{:.1f}%",
+            "Avg_Return": "{:+.2f}%",
+            "Median_Return": "{:+.2f}%",
+            "Profit_Factor": "{:.2f}",
+            "Max_Drawdown": "{:.1f}%"
+        }),
+        use_container_width=True,
+        hide_index=True
+    )
+
+    closed = load_portfolio()
+    if not closed.empty:
+        closed = closed[(closed.status == "CLOSED") & closed.recommendation_id.notna()].copy()
+
+    if not closed.empty:
+        st.divider()
+        st.subheader("🔗 Composite Score vs Realised P&L")
+        rec_ids = closed.recommendation_id.astype(str).tolist()
+        rec_res = sb.table("recommendations").select("id,composite_score,score_label").in_("id", rec_ids).execute()
+
+        if rec_res.data:
+            rec_df = pd.DataFrame(rec_res.data)
+            rec_df["id"] = rec_df["id"].astype(str)
+            closed["recommendation_id"] = closed["recommendation_id"].astype(str)
+            merged = closed.merge(rec_df, left_on="recommendation_id", right_on="id", how="inner")
+
+            if not merged.empty:
+                fig_sc = px.scatter(
+                    merged,
+                    x="composite_score",
+                    y="pnl_pct",
+                    color="pnl_pct",
+                    color_continuous_scale="RdYlGn",
+                    hover_data=["ticker", "score_label", "exit_reason"],
+                    title="Composite Score vs Realised P&L %"
+                )
+                fig_sc.add_hline(y=0, line_dash="dash", line_color="gray")
+                fig_sc.update_layout(
+                    height=350,
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    paper_bgcolor="rgba(0,0,0,0)"
+                )
+                st.plotly_chart(fig_sc, use_container_width=True)
+
+# ─────────────────────────────────────────────
+#  PAGE: OPTIMIZER
+# ─────────────────────────────────────────────
+elif page == "🤖 Optimizer":
+    st.title("🤖 Parameter Optimizer")
+    st.caption("Champion, challenger, full version history, promotion controls, and optimization runs.")
+
+    params_df = load_agent_params()
+    opt_runs = load_opt_runs()
+
+    if params_df.empty:
+        st.info("No optimization runs yet. The optimizer runs every Sunday at 11 PM IST, or trigger it manually from GitHub Actions.")
+        st.stop()
+
+    champion = params_df[params_df.status == "champion"].head(1)
+    challenger = params_df[params_df.status == "challenger"].head(1)
+    candidates = params_df[params_df.status == "candidate"].copy()
+    all_versions = params_df.copy()
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.markdown("### 👑 Champion")
+        if not champion.empty:
+            r = champion.iloc[0]
+            st.success(f"**v{r['version']}** | Score: {safe_float(r['objective_score']):.4f}")
+            st.caption(
+                f"PF: {safe_float(r.get('profit_factor', 0)):.2f} | "
+                f"WR: {safe_float(r.get('win_rate', 0)):.1f}% | "
+                f"Avg Ret: {safe_float(r.get('avg_return', 0)):+.2f}% | "
+                f"Max DD: {safe_float(r.get('max_drawdown', 0)):.1f}%"
+            )
+            st.caption(f"Promoted: {r.get('promoted_at', '?')}")
+        else:
+            st.warning("No champion yet")
+
+    with col2:
+        st.markdown("### ⚔️ Challenger")
+        if not challenger.empty:
+            r = challenger.iloc[0]
+            champ_score = safe_float(champion.iloc[0]["objective_score"]) if not champion.empty else 0.0
+            delta = safe_float(r["objective_score"]) - champ_score
+            marker = "🟢" if delta > 0 else "🔴"
+            st.info(f"**v{r['version']}** | Score: {safe_float(r['objective_score']):.4f} {marker} {delta:+.4f} vs champion")
+            st.caption(
+                f"PF: {safe_float(r.get('profit_factor', 0)):.2f} | "
+                f"WR: {safe_float(r.get('win_rate', 0)):.1f}% | "
+                f"Avg Ret: {safe_float(r.get('avg_return', 0)):+.2f}% | "
+                f"Max DD: {safe_float(r.get('max_drawdown', 0)):.1f}%"
+            )
+            st.caption(f"Promoted: {r.get('promoted_at', '?')}")
+        else:
+            st.info("No challenger yet")
+
+    with col3:
+        st.markdown("### 📋 Candidates")
+        st.metric("Available", len(candidates))
+        if not opt_runs.empty:
+            st.caption(f"Last optimization: {opt_runs.iloc[0]['run_date']}")
+            st.caption(
+                f"Trials: {safe_int(opt_runs.iloc[0].get('n_trials', 0))} | "
+                f"Valid: {safe_int(opt_runs.iloc[0].get('n_valid_trials', 0))}"
             )
 
-            safe_record = sanitize_for_json(record)
-            json.dumps(safe_record)
-            records.append(safe_record)
+    st.divider()
 
-        except Exception as e:
-            print(f"\n  Skipping {ticker} due to processing error: {e}")
+    if not champion.empty and not challenger.empty:
+        st.subheader("📊 Champion vs Challenger — Parameter Diff")
 
-        time.sleep(0.1)
+        champ_p = json.loads(champion.iloc[0]["params_json"]) if isinstance(champion.iloc[0]["params_json"], str) else champion.iloc[0]["params_json"]
+        chall_p = json.loads(challenger.iloc[0]["params_json"]) if isinstance(challenger.iloc[0]["params_json"], str) else challenger.iloc[0]["params_json"]
 
-    sys.stdout.write("\r" + " " * 60 + "\r")
-    failed_count = sum(1 for l in run_logs if l['status'] != 'ok')
-    print(f"  Pipeline summary:")
-    print(f"    Tickers scanned  : {len(ALL_TICKERS)}")
-    print(f"    Data fetched OK  : {gate_counts['fetched']}")
-    print(f"    Any signal fired : {gate_counts['any_signal']}")
-    print(f"    Passed weight    : {gate_counts['passed_weight']}  (MIN_WEIGHTED_SCORE={P['MIN_WEIGHTED_SCORE']})")
-    print(f"    Final signals    : {len(records)}")
-    print(f"    Failed fetches   : {failed_count}\n")
+        all_keys = sorted(set(list(champ_p.keys()) + list(chall_p.keys())))
+        diff_rows = []
+        for k in all_keys:
+            cv = champ_p.get(k, "–")
+            chv = chall_p.get(k, "–")
+            diff_rows.append({
+                "Parameter": k,
+                f"Champion v{champion.iloc[0]['version']}": cv,
+                f"Challenger v{challenger.iloc[0]['version']}": chv,
+                "Changed": "✅" if cv != chv else ""
+            })
 
-    if records:
-        print(f"  Saving {len(records)} recommendations to Supabase...")
-        saved = 0
-        for i in range(0, len(records), 20):
-            batch = records[i:i + 20]
-            try:
-                supabase.table("recommendations").insert(batch).execute()
-                saved += len(batch)
-            except Exception as e:
-                print(f"  INSERT ERROR batch {i//20 + 1}: {e}")
-                print(f"  First record keys: {list(batch[0].keys())}")
-        print(f"  Saved {saved}/{len(records)} recommendations")
+        diff_df = pd.DataFrame(diff_rows)
+        changed_only = st.checkbox("Show changed params only", value=True)
+        if changed_only:
+            diff_df = diff_df[diff_df["Changed"] == "✅"]
+        st.dataframe(diff_df, use_container_width=True, hide_index=True)
+
+        st.subheader("📈 Walk-Forward Metrics Comparison")
+        metrics_to_compare = [
+            ("Objective Score", "objective_score"),
+            ("Profit Factor", "profit_factor"),
+            ("Win Rate %", "win_rate"),
+            ("Avg Return %", "avg_return"),
+            ("Max Drawdown %", "max_drawdown"),
+        ]
+        mc1, mc2, mc3, mc4, mc5 = st.columns(5)
+        cols = [mc1, mc2, mc3, mc4, mc5]
+
+        for col, (label, field) in zip(cols, metrics_to_compare):
+            cv = safe_float(champion.iloc[0].get(field, 0))
+            chv = safe_float(challenger.iloc[0].get(field, 0))
+            delta = chv - cv
+            better = (delta > 0 and field != "max_drawdown") or (delta < 0 and field == "max_drawdown")
+            col.metric(label, f"{chv:.3f}", delta=f"{delta:+.3f}", delta_color="normal" if better else "inverse")
+
+        st.divider()
+        st.subheader("🎛️ Promotion Controls")
+        st.warning("⚠️ Promoting challenger replaces the live champion. Do this only after review / paper-trade monitoring.")
+        pr1, pr2 = st.columns(2)
+        with pr1:
+            if st.button(f"👑 Promote Challenger v{challenger.iloc[0]['version']} → Champion", type="primary"):
+                promote_param(int(challenger.iloc[0]["version"]), "champion")
+                st.success(f"✅ Challenger v{challenger.iloc[0]['version']} is now Champion!")
+                st.rerun()
+        with pr2:
+            if st.button(f"🗑️ Retire Challenger v{challenger.iloc[0]['version']}"):
+                promote_param(int(challenger.iloc[0]["version"]), "retired")
+                st.info(f"Challenger v{challenger.iloc[0]['version']} retired.")
+                st.rerun()
+
+    st.divider()
+
+    st.subheader("📋 Unpromoted Candidates")
+    if candidates.empty:
+        st.info("No candidate versions currently available.")
     else:
-        print(f"  No signals met threshold (MIN_WEIGHTED_SCORE={P['MIN_WEIGHTED_SCORE']})")
-        print(f"  Scanned {len(ALL_TICKERS)} tickers, 0 passed filter")
+        cand_display = candidates[[
+            "version", "objective_score", "profit_factor", "win_rate", "avg_return",
+            "max_drawdown", "total_trades", "run_date", "rank", "notes"
+        ]].copy()
+        cand_display.columns = [
+            "Version", "Score", "Profit Factor", "Win Rate %",
+            "Avg Return %", "Max Drawdown %", "Trades", "Run Date", "Rank", "Notes"
+        ]
+        st.dataframe(
+            cand_display.style.format({
+                "Score": "{:.4f}",
+                "Profit Factor": "{:.2f}",
+                "Win Rate %": "{:.1f}%",
+                "Avg Return %": "{:+.2f}%",
+                "Max Drawdown %": "{:.1f}%"
+            }),
+            use_container_width=True,
+            hide_index=True
+        )
 
-    try:
-        for i in range(0, len(run_logs), 50):
-            supabase.table("ticker_run_log").insert(run_logs[i:i + 50]).execute()
-    except Exception as e:
-        print(f"  Run log insert failed: {e}")
+        st.subheader("🔧 Manually Promote a Candidate")
+        cand_versions = candidates["version"].tolist()
+        sel_v = st.selectbox("Select candidate version", cand_versions)
 
-    try:
-        supabase.table("agent_meta").upsert(sanitize_for_json({
-            "id": 1,
-            "last_run": today,
-            "total_signals": len(records),
-            "tickers_scanned": len(ALL_TICKERS),
-            "failed": sum(1 for l in run_logs if l["status"] != "ok"),
-            "market_regime": regime_label,
-            "active_param_version": param_version,
-        })).execute()
-    except Exception as e:
-        print(f"  Meta upsert failed: {e}")
+        mc1, mc2 = st.columns(2)
+        if mc1.button("⚔️ Set as Challenger"):
+            promote_param(int(sel_v), "challenger")
+            st.success(f"v{sel_v} is now Challenger.")
+            st.rerun()
 
-    print("  Done ✅\n")
+        if mc2.button("👑 Promote directly to Champion"):
+            promote_param(int(sel_v), "champion")
+            st.success(f"v{sel_v} is now Champion.")
+            st.rerun()
 
-if __name__ == "__main__":
-    run()
+    st.divider()
+    st.subheader("🗂️ All Parameter Versions")
+
+    all_display = all_versions[[
+        "version", "status", "objective_score", "profit_factor", "win_rate",
+        "avg_return", "max_drawdown", "total_trades", "run_date", "rank", "notes"
+    ]].copy()
+    all_display.columns = [
+        "Version", "Status", "Score", "Profit Factor", "Win Rate %",
+        "Avg Return %", "Max Drawdown %", "Trades", "Run Date", "Rank", "Notes"
+    ]
+    st.dataframe(
+        all_display.style.format({
+            "Score": "{:.4f}",
+            "Profit Factor": "{:.2f}",
+            "Win Rate %": "{:.1f}%",
+            "Avg Return %": "{:+.2f}%",
+            "Max Drawdown %": "{:.1f}%"
+        }),
+        use_container_width=True,
+        hide_index=True
+    )
+
+    st.divider()
+    st.subheader("📜 Optimization Run History")
+    if opt_runs.empty:
+        st.info("No optimization history yet.")
+    else:
+        fig_hist = px.line(
+            opt_runs.sort_values("run_date"),
+            x="run_date", y="best_score",
+            markers=True, title="Best Objective Score per Optimization Run"
+        )
+        fig_hist.update_layout(
+            height=260, margin=dict(t=30, b=10, l=0, r=0),
+            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)"
+        )
+        st.plotly_chart(fig_hist, use_container_width=True)
+
+        st.dataframe(
+            opt_runs[[
+                "run_date", "n_trials", "n_valid_trials", "best_score",
+                "best_profit_factor", "best_win_rate", "best_avg_return",
+                "champion_version", "challenger_version"
+            ]].style.format({
+                "best_score": "{:.4f}",
+                "best_profit_factor": "{:.2f}",
+                "best_win_rate": "{:.1f}%",
+                "best_avg_return": "{:+.2f}%"
+            }),
+            use_container_width=True,
+            hide_index=True
+        )
+
+    st.divider()
+    st.subheader("⚙️ Currently Active Parameters")
+    if not champion.empty:
+        active_p = json.loads(champion.iloc[0]["params_json"]) if isinstance(champion.iloc[0]["params_json"], str) else champion.iloc[0]["params_json"]
+        p_df = pd.DataFrame([{"Parameter": k, "Value": v} for k, v in sorted(active_p.items())])
+        st.dataframe(p_df, use_container_width=True, hide_index=True)
+    else:
+        st.info("Using default parameters (no champion set yet).")
+
+# ─────────────────────────────────────────────
+#  FOOTER
+# ─────────────────────────────────────────────
+st.divider()
+st.caption(
+    "⚠️ Paper trading & educational purposes only. Not financial advice. "
+    "Past backtest results do not guarantee future performance."
+)
