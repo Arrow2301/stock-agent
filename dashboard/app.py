@@ -167,6 +167,27 @@ def load_recs(target_date=None, days_back=None):
     for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # Compatibility with older analyze.py field names
+    if "streak" not in df.columns and "signal_streak" in df.columns:
+        df["streak"] = pd.to_numeric(df["signal_streak"], errors="coerce")
+    if "news_label" not in df.columns and "news_sentiment" in df.columns:
+        df["news_label"] = df["news_sentiment"].fillna("NEUTRAL").astype(str).str.lower()
+    if "news_headlines" not in df.columns and "news_headline" in df.columns:
+        df["news_headlines"] = df["news_headline"].apply(lambda x: [x] if isinstance(x, str) and x.strip() else [])
+    if "news_multiplier" not in df.columns:
+        df["news_multiplier"] = 1.0
+    if "fundamental_score" not in df.columns and "fundamental_flag" in df.columns:
+        def _fs(v):
+            if v in [None, "", "DATA_UNAVAILABLE"]: return 50
+            return 85 if str(v) == "OK" else 60
+        df["fundamental_score"] = df["fundamental_flag"].apply(_fs)
+    if "fundamental_warnings" not in df.columns and "fundamental_flag" in df.columns:
+        df["fundamental_warnings"] = df["fundamental_flag"].apply(lambda x: [] if x in [None, "", "OK", "DATA_UNAVAILABLE"] else [s.strip() for s in str(x).split(',') if s.strip()])
+    if "de_ratio" not in df.columns and "debt_equity" in df.columns:
+        df["de_ratio"] = pd.to_numeric(df["debt_equity"], errors="coerce")
+    if "sector" not in df.columns:
+        df["sector"] = "Unknown"
     return df
 
 @st.cache_data(ttl=60)

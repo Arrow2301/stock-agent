@@ -168,3 +168,84 @@ CREATE TABLE IF NOT EXISTS optimization_runs (
 );
 ALTER TABLE optimization_runs DISABLE ROW LEVEL SECURITY;
 
+
+
+-- v5 compatibility upgrades
+ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS company_name TEXT;
+ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS debt_equity FLOAT;
+ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS fundamental_flag TEXT;
+ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS news_sentiment TEXT;
+ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS news_headline TEXT;
+ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS news_alert BOOLEAN DEFAULT FALSE;
+ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS signal_streak INT;
+ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS streak INT;
+ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS news_label TEXT;
+ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS news_count INT;
+ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS news_headlines JSONB;
+ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS news_multiplier FLOAT;
+ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS fundamental_score FLOAT;
+ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS fundamental_warnings JSONB;
+ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS market_cap_cr FLOAT;
+ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS de_ratio FLOAT;
+ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS roe FLOAT;
+ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS sector TEXT;
+
+ALTER TABLE agent_meta ADD COLUMN IF NOT EXISTS total_buys INT DEFAULT 0;
+ALTER TABLE agent_meta ADD COLUMN IF NOT EXISTS total_sells INT DEFAULT 0;
+ALTER TABLE agent_meta ADD COLUMN IF NOT EXISTS breadth_ratio FLOAT;
+ALTER TABLE agent_meta ADD COLUMN IF NOT EXISTS breadth_label TEXT;
+ALTER TABLE agent_meta ADD COLUMN IF NOT EXISTS breadth_buys INT DEFAULT 0;
+ALTER TABLE agent_meta ADD COLUMN IF NOT EXISTS breadth_sells INT DEFAULT 0;
+ALTER TABLE agent_meta ADD COLUMN IF NOT EXISTS breadth_neutral INT DEFAULT 0;
+
+CREATE TABLE IF NOT EXISTS stock_fundamentals (
+    ticker                TEXT PRIMARY KEY,
+    fetch_date            DATE NOT NULL,
+    market_cap_cr         FLOAT,
+    pe_ratio              FLOAT,
+    pb_ratio              FLOAT,
+    de_ratio              FLOAT,
+    roe                   FLOAT,
+    revenue_growth        FLOAT,
+    profit_growth         FLOAT,
+    sector                TEXT,
+    dividend_yield        FLOAT,
+    fundamental_score     FLOAT,
+    fundamental_warnings  JSONB,
+    created_at            TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS backtest_simulations (
+    id                  BIGSERIAL PRIMARY KEY,
+    recommendation_id   BIGINT UNIQUE,
+    ticker              TEXT NOT NULL,
+    signal_date         DATE NOT NULL,
+    action              TEXT NOT NULL,
+    entry_price         FLOAT,
+    exit_price          FLOAT,
+    exit_date           DATE,
+    exit_reason         TEXT,
+    actual_return_pct   FLOAT,
+    composite_score     FLOAT,
+    predicted_win_rate  FLOAT,
+    was_win             BOOLEAN,
+    days_held           INT,
+    run_date            DATE,
+    created_at          TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_backsim_signal_date ON backtest_simulations (signal_date DESC);
+
+CREATE TABLE IF NOT EXISTS simulation_meta (
+    id                  INT PRIMARY KEY DEFAULT 1,
+    last_run            DATE,
+    total_simulated     INT DEFAULT 0,
+    actual_win_rate     FLOAT,
+    actual_avg_return   FLOAT,
+    pending_unprocessed INT DEFAULT 0,
+    updated_at          TIMESTAMPTZ DEFAULT NOW()
+);
+INSERT INTO simulation_meta (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
+
+ALTER TABLE stock_fundamentals DISABLE ROW LEVEL SECURITY;
+ALTER TABLE backtest_simulations DISABLE ROW LEVEL SECURITY;
+ALTER TABLE simulation_meta DISABLE ROW LEVEL SECURITY;
