@@ -1,0 +1,21 @@
+name: Weekly Backsimulation
+on:
+  schedule:
+    - cron: "30 17 * * 0"   # Sunday 11:00 PM IST
+  workflow_dispatch:
+jobs:
+  backsimulate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - run: pip install -r requirements.txt
+      - name: Run weekly backsimulation
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python agent/backsimulate.py
