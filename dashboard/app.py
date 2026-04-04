@@ -384,9 +384,11 @@ def breadth_gauge(buys, sells, neutral):
 
 def strategy_histogram(returns_list, strategy_name, bins=20):
     """Return % histogram for a single strategy."""
-    arr = pd.Series([r for r in returns_list
-                     if r is not None and not np.isnan(float(r))],
-                    dtype=float)
+    arr = pd.Series(
+        [float(r) for r in returns_list if r is not None and pd.notna(r)
+         and isinstance(r, (int, float)) and np.isfinite(float(r))],
+        dtype=float,
+    )
     if arr.empty:
         return None
     wins  = (arr > 0).sum()
