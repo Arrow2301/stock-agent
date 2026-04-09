@@ -198,8 +198,15 @@ def load_portfolio():
 @st.cache_data(ttl=90)
 def live_price(ticker):
     try:
-        df = yf.download(ticker + ".NS", period="3d", progress=False, auto_adjust=True)
-        return float(df["Close"].iloc[-1]) if not df.empty else 0.0
+        df = yf.download(ticker + ".NS", period="5d", progress=False, auto_adjust=True)
+        if df.empty:
+            return 0.0
+        # Flatten multi-level columns that yfinance sometimes returns
+        df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+        close = df["Close"].dropna()
+        if close.empty:
+            return 0.0
+        return float(close.iloc[-1])
     except Exception:
         return 0.0
 
