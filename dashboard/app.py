@@ -167,27 +167,6 @@ def load_recs(target_date=None, days_back=None):
     for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    # Compatibility with older analyze.py field names
-    if "streak" not in df.columns and "signal_streak" in df.columns:
-        df["streak"] = pd.to_numeric(df["signal_streak"], errors="coerce")
-    if "news_label" not in df.columns and "news_sentiment" in df.columns:
-        df["news_label"] = df["news_sentiment"].fillna("NEUTRAL").astype(str).str.lower()
-    if "news_headlines" not in df.columns and "news_headline" in df.columns:
-        df["news_headlines"] = df["news_headline"].apply(lambda x: [x] if isinstance(x, str) and x.strip() else [])
-    if "news_multiplier" not in df.columns:
-        df["news_multiplier"] = 1.0
-    if "fundamental_score" not in df.columns and "fundamental_flag" in df.columns:
-        def _fs(v):
-            if v in [None, "", "DATA_UNAVAILABLE"]: return 50
-            return 85 if str(v) == "OK" else 60
-        df["fundamental_score"] = df["fundamental_flag"].apply(_fs)
-    if "fundamental_warnings" not in df.columns and "fundamental_flag" in df.columns:
-        df["fundamental_warnings"] = df["fundamental_flag"].apply(lambda x: [] if x in [None, "", "OK", "DATA_UNAVAILABLE"] else [s.strip() for s in str(x).split(',') if s.strip()])
-    if "de_ratio" not in df.columns and "debt_equity" in df.columns:
-        df["de_ratio"] = pd.to_numeric(df["debt_equity"], errors="coerce")
-    if "sector" not in df.columns:
-        df["sector"] = "Unknown"
     return df
 
 @st.cache_data(ttl=60)
@@ -198,15 +177,8 @@ def load_portfolio():
 @st.cache_data(ttl=90)
 def live_price(ticker):
     try:
-        df = yf.download(ticker + ".NS", period="5d", progress=False, auto_adjust=True)
-        if df.empty:
-            return 0.0
-        # Flatten multi-level columns that yfinance sometimes returns
-        df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
-        close = df["Close"].dropna()
-        if close.empty:
-            return 0.0
-        return float(close.iloc[-1])
+        df = yf.download(ticker + ".NS", period="3d", progress=False, auto_adjust=True)
+        return float(df["Close"].iloc[-1]) if not df.empty else 0.0
     except Exception:
         return 0.0
 
@@ -391,11 +363,9 @@ def breadth_gauge(buys, sells, neutral):
 
 def strategy_histogram(returns_list, strategy_name, bins=20):
     """Return % histogram for a single strategy."""
-    arr = pd.Series(
-        [float(r) for r in returns_list if r is not None and pd.notna(r)
-         and isinstance(r, (int, float)) and np.isfinite(float(r))],
-        dtype=float,
-    )
+    arr = pd.Series([r for r in returns_list
+                     if r is not None and not np.isnan(float(r))],
+                    dtype=float)
     if arr.empty:
         return None
     wins  = (arr > 0).sum()
@@ -448,7 +418,15 @@ def render_news_panel(row):
         unsafe_allow_html=True,
     )
     for h in headlines:
-        st.markdown(f"- {h}")
+        if isinstance(h, dict):
+            headline = str(h.get("headline", "")).strip()
+            item_score = safe_float(h.get("score"), None)
+            item_label = str(h.get("label") or "").upper()
+            if headline:
+                extra = f" ({item_label} {item_score:+.3f})" if item_label and item_score is not None else ""
+                st.markdown(f"- {headline}{extra}")
+        else:
+            st.markdown(f"- {h}")
 
 # ─────────────────────────────────────────────
 #  COMPONENT: FUNDAMENTALS PANEL
