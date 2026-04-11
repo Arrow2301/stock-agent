@@ -44,6 +44,12 @@ try:
 except ImportError:
     _GNEWS_OK = False
 
+try:
+    from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+    _VADER_OK = True
+except ImportError:
+    _VADER_OK = False
+
 warnings.filterwarnings("ignore")
 
 # ─────────────────────────────────────────────
@@ -392,11 +398,15 @@ def fetch_fundamentals(ticker: str) -> dict:
     All numeric fields default to None on failure (permissive).
     """
     _default = {
-        "company_name":     NSE_COMPANY_NAMES.get(ticker, ticker),
-        "pe_ratio":         None,
-        "debt_equity":      None,
-        "revenue_growth":   None,
-        "fundamental_flag": "DATA_UNAVAILABLE",
+        "company_name":      NSE_COMPANY_NAMES.get(ticker, ticker),
+        "pe_ratio":          None,
+        "debt_equity":       None,
+        "revenue_growth":    None,
+        "sector":            None,
+        "market_cap_cr":     None,
+        "roe":               None,
+        "fundamental_score": 50,
+        "fundamental_flag":  "DATA_UNAVAILABLE",
     }
     try:
         info = yf.Ticker(ticker + ".NS").info
@@ -426,12 +436,47 @@ def fetch_fundamentals(ticker: str) -> dict:
             except Exception:
                 return None
 
+        # Market cap in crores
+        mc_raw = info.get("marketCap") or 0
+        mc_cr  = round(mc_raw / 1e7, 0) if mc_raw > 0 else None
+
+        # ROE
+        roe_raw = info.get("returnOnEquity")
+        roe_val = round(float(roe_raw) * 100, 1) if roe_raw is not None and math.isfinite(float(roe_raw)) else None
+
+        # Sector
+        sector_val = info.get("sector") or None
+
+        # Compute a real fundamental score (0-100)
+        f_score = 50
+        if _safe(pe) is not None:
+            if 5 < _safe(pe) < 30:   f_score += 10
+            elif _safe(pe) > 80:     f_score -= 10
+            elif _safe(pe) < 0:      f_score -= 15
+        if roe_val is not None:
+            if roe_val > 15:         f_score += 10
+            elif roe_val < 0:        f_score -= 10
+        if _safe(rg) is not None:
+            if _safe(rg) > 0.10:     f_score += 10
+            elif _safe(rg) < -0.10:  f_score -= 15
+        if _safe(de) is not None:
+            de_adj = _safe(de) / 100 if _safe(de) > 20 else _safe(de)
+            if de_adj < 0.5:         f_score += 10
+            elif de_adj > 3:         f_score -= 10
+        if mc_cr and mc_cr > 20000:  f_score += 5
+        elif mc_cr and mc_cr < 500:  f_score -= 10
+        f_score = max(0, min(100, f_score))
+
         return {
-            "company_name":     name,
-            "pe_ratio":         round(_safe(pe), 1)         if _safe(pe)  is not None else None,
-            "debt_equity":      round(_safe(de), 1)         if _safe(de)  is not None else None,
-            "revenue_growth":   round(_safe(rg) * 100, 1)   if _safe(rg)  is not None else None,
-            "fundamental_flag": ", ".join(flags) if flags else "OK",
+            "company_name":      name,
+            "pe_ratio":          round(_safe(pe), 1)       if _safe(pe)  is not None else None,
+            "debt_equity":       round(_safe(de), 1)       if _safe(de)  is not None else None,
+            "revenue_growth":    round(_safe(rg) * 100, 1) if _safe(rg)  is not None else None,
+            "sector":            sector_val,
+            "market_cap_cr":     mc_cr,
+            "roe":               roe_val,
+            "fundamental_score": f_score,
+            "fundamental_flag":  ", ".join(flags) if flags else "OK",
         }
     except Exception:
         return _default
@@ -1055,10 +1100,13 @@ def run():
                 )
             else:
                 news = {
-                    "news_score":     None,
-                    "news_sentiment": None,
-                    "news_headline":  None,
-                    "news_alert":     False,
+                    "news_score": 0.0,
+                    "news_sentiment": "NEUTRAL",
+                    "news_headline": None,
+                    "news_headlines": [],
+                    "news_count": 0,
+                    "news_multiplier": 1.0,
+                    "news_alert": False,
                 }
 
             # ── Signal streak (previous days + today = total)
@@ -1106,13 +1154,26 @@ def run():
                 debt_equity       = fund.get("debt_equity"),
                 revenue_growth    = fund.get("revenue_growth"),
                 fundamental_flag  = fund.get("fundamental_flag"),
+                # Additional fundamental fields from yfinance
+                de_ratio          = fund.get("debt_equity"),
+                sector            = fund.get("sector"),
+                market_cap_cr     = fund.get("market_cap_cr"),
+                roe               = fund.get("roe"),
+                fundamental_score = fund.get("fundamental_score", 50),
+                fundamental_warnings = json.dumps([] if fund.get("fundamental_flag") in (None, "", "OK", "DATA_UNAVAILABLE") else [x.strip() for x in str(fund.get("fundamental_flag", "")).split(',') if x.strip()]),
                 # News
                 news_score        = news.get("news_score"),
                 news_sentiment    = news.get("news_sentiment"),
                 news_headline     = news.get("news_headline"),
                 news_alert        = bool(news.get("news_alert", False)),
+                # Dashboard/schema aliases for compatibility
+                news_label        = (news.get("news_sentiment") or "NEUTRAL").lower(),
+                news_headlines    = json.dumps(sanitize_for_json(news.get("news_headlines") or ([news.get("news_headline")] if news.get("news_headline") else []))),
+                news_multiplier   = float(news.get("news_multiplier", 1.0)),
+                news_count        = int(news.get("news_count", 1 if news.get("news_headline") else 0)),
                 # Streak
                 signal_streak     = streak_today,
+                streak            = streak_today,
                 **ctx,
             )
 
@@ -1180,6 +1241,9 @@ def run():
             "total_sells":           breadth["sell_count"],
             "breadth_ratio":         breadth["breadth_ratio"],
             "breadth_label":         breadth["breadth_label"],
+            "breadth_buys":          breadth["buy_count"],
+            "breadth_sells":         breadth["sell_count"],
+            "breadth_neutral":       max(0, len(ALL_TICKERS) - breadth["buy_count"] - breadth["sell_count"]),
         })).execute()
     except Exception as e:
         print(f"  ⚠️  Meta upsert failed: {e}")
