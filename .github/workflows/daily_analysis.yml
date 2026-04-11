@@ -5,7 +5,7 @@ on:
   # GitHub free tier can delay up to 1-2 hours, so worst case ~8:30 AM IST
   # Still before NSE market open at 9:15 AM IST
   schedule:
-    - cron: "0 1 * * 1-5"   # Monday–Friday 01:00 UTC = 06:30 AM IST
+    - cron: "10 0 * * 1-5"   # Monday–Friday 01:00 UTC = 06:30 AM IST
 
   # Also allow manual trigger from GitHub UI
   workflow_dispatch:
