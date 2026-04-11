@@ -6,4 +6,5 @@ streamlit>=1.32.0
 plotly>=5.18.0
 optuna>=3.6.0
 gnews>=0.3.6
+vaderSentiment>=3.3.2
 requests>=2.31.0
