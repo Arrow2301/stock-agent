@@ -28,6 +28,7 @@ import sys
 import time
 import json
 import math
+import re
 import warnings
 from datetime import datetime, timedelta
 
@@ -42,12 +43,6 @@ try:
     _GNEWS_OK = True
 except ImportError:
     _GNEWS_OK = False
-
-try:
-    from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-    _VADER_OK = True
-except ImportError:
-    _VADER_OK = False
 
 warnings.filterwarnings("ignore")
 
@@ -397,15 +392,11 @@ def fetch_fundamentals(ticker: str) -> dict:
     All numeric fields default to None on failure (permissive).
     """
     _default = {
-        "company_name":      NSE_COMPANY_NAMES.get(ticker, ticker),
-        "pe_ratio":          None,
-        "debt_equity":       None,
-        "revenue_growth":    None,
-        "sector":            None,
-        "market_cap_cr":     None,
-        "roe":               None,
-        "fundamental_score": 50,
-        "fundamental_flag":  "DATA_UNAVAILABLE",
+        "company_name":     NSE_COMPANY_NAMES.get(ticker, ticker),
+        "pe_ratio":         None,
+        "debt_equity":      None,
+        "revenue_growth":   None,
+        "fundamental_flag": "DATA_UNAVAILABLE",
     }
     try:
         info = yf.Ticker(ticker + ".NS").info
@@ -435,47 +426,12 @@ def fetch_fundamentals(ticker: str) -> dict:
             except Exception:
                 return None
 
-        # Market cap in crores
-        mc_raw = info.get("marketCap") or 0
-        mc_cr  = round(mc_raw / 1e7, 0) if mc_raw > 0 else None
-
-        # ROE
-        roe_raw = info.get("returnOnEquity")
-        roe_val = round(float(roe_raw) * 100, 1) if roe_raw is not None and math.isfinite(float(roe_raw)) else None
-
-        # Sector
-        sector_val = info.get("sector") or None
-
-        # Compute a real fundamental score (0-100)
-        f_score = 50
-        if _safe(pe) is not None:
-            if 5 < _safe(pe) < 30:   f_score += 10
-            elif _safe(pe) > 80:     f_score -= 10
-            elif _safe(pe) < 0:      f_score -= 15
-        if roe_val is not None:
-            if roe_val > 15:         f_score += 10
-            elif roe_val < 0:        f_score -= 10
-        if _safe(rg) is not None:
-            if _safe(rg) > 0.10:     f_score += 10
-            elif _safe(rg) < -0.10:  f_score -= 15
-        if _safe(de) is not None:
-            de_adj = _safe(de) / 100 if _safe(de) > 20 else _safe(de)
-            if de_adj < 0.5:         f_score += 10
-            elif de_adj > 3:         f_score -= 10
-        if mc_cr and mc_cr > 20000:  f_score += 5
-        elif mc_cr and mc_cr < 500:  f_score -= 10
-        f_score = max(0, min(100, f_score))
-
         return {
-            "company_name":      name,
-            "pe_ratio":          round(_safe(pe), 1)       if _safe(pe)  is not None else None,
-            "debt_equity":       round(_safe(de), 1)       if _safe(de)  is not None else None,
-            "revenue_growth":    round(_safe(rg) * 100, 1) if _safe(rg)  is not None else None,
-            "sector":            sector_val,
-            "market_cap_cr":     mc_cr,
-            "roe":               roe_val,
-            "fundamental_score": f_score,
-            "fundamental_flag":  ", ".join(flags) if flags else "OK",
+            "company_name":     name,
+            "pe_ratio":         round(_safe(pe), 1)         if _safe(pe)  is not None else None,
+            "debt_equity":      round(_safe(de), 1)         if _safe(de)  is not None else None,
+            "revenue_growth":   round(_safe(rg) * 100, 1)   if _safe(rg)  is not None else None,
+            "fundamental_flag": ", ".join(flags) if flags else "OK",
         }
     except Exception:
         return _default
@@ -486,24 +442,81 @@ def fetch_fundamentals(ticker: str) -> dict:
 #  Only runs when HF_TOKEN env var is set.
 # ─────────────────────────────────────────────
 
+def _normalize_news_text(text: str) -> str:
+    text = (text or "").lower()
+    text = re.sub(r"[^a-z0-9&+ ]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _company_aliases(ticker: str, company_name: str) -> list[str]:
+    raw = [ticker or "", company_name or ""]
+    cleaned = company_name or ""
+    for suffix in [" Limited", " Ltd", " Ltd.", " Corporation", " Corp", " Company"]:
+        if cleaned.endswith(suffix):
+            raw.append(cleaned[: -len(suffix)])
+
+    aliases: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        norm = _normalize_news_text(item.replace("NSE:", "").replace("BSE:", ""))
+        if norm and len(norm) >= 3 and norm not in seen:
+            aliases.append(norm)
+            seen.add(norm)
+        compact = norm.replace(" ", "")
+        if compact and len(compact) >= 4 and compact not in seen:
+            aliases.append(compact)
+            seen.add(compact)
+    return aliases
+
+
+def _headline_is_relevant(headline: str, ticker: str, company_name: str) -> bool:
+    norm = _normalize_news_text(headline)
+    if not norm:
+        return False
+    aliases = _company_aliases(ticker, company_name)
+    if not aliases:
+        return False
+    compact_norm = norm.replace(" ", "")
+    return any(alias in norm or alias.replace(" ", "") in compact_norm for alias in aliases)
+
+
 def _fetch_news_headlines(ticker: str, company_name: str, n: int = 5) -> list[str]:
-    """
-    Fetch recent headlines via gnews.
-    Returns list of headline strings, empty list on failure.
-    """
+    """Fetch recent headlines via GNews and keep only clearly relevant ones."""
     if not _GNEWS_OK:
         return []
+
+    queries: list[str] = []
+    if company_name:
+        queries.extend([
+            f'"{company_name}" stock',
+            f'"{company_name}" share',
+            f'"{company_name}" news',
+        ])
+    queries.extend([
+        f'"{ticker}" NSE',
+        f'"{ticker}" stock',
+        f'"{ticker}" share',
+    ])
+
+    seen: set[str] = set()
+    kept: list[str] = []
     try:
-        gn      = GNews(language="en", country="IN", period="3d", max_results=n)
-        results = gn.get_news(f"{company_name} NSE India stock")
-        if not results:
-            results = gn.get_news(f"{ticker} NSE share price India")
-        headlines = [
-            r.get("title", "").strip()
-            for r in (results or [])
-            if r.get("title") and len(r["title"].strip()) > 10
-        ]
-        return headlines[:n]
+        gn = GNews(language="en", country="IN", period="7d", max_results=max(8, n * 2))
+        for query in queries:
+            for row in gn.get_news(query) or []:
+                headline = (row.get("title") or "").strip()
+                if len(headline) <= 10:
+                    continue
+                key = headline.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                if _headline_is_relevant(headline, ticker, company_name):
+                    kept.append(headline)
+                    if len(kept) >= n:
+                        return kept
+        return kept[:n]
     except Exception:
         return []
 
@@ -528,16 +541,13 @@ def _news_multiplier_from_score(score: float) -> float:
     return 1.00
 
 
-def _score_headline_with_finbert(headline: str, hf_token: str) -> tuple[float, str] | None:
-    """Score one headline with FinBERT. Returns None if the API call fails."""
+def _score_headline_with_finbert(headline: str, hf_token: str):
     if not headline or not hf_token:
         return None
-
     headers = {
         "Authorization": f"Bearer {hf_token}",
         "Content-Type": "application/json",
     }
-
     for attempt in range(3):
         try:
             resp = requests.post(
@@ -550,7 +560,11 @@ def _score_headline_with_finbert(headline: str, hf_token: str) -> tuple[float, s
                 data = resp.json()
                 if isinstance(data, list) and data:
                     scores_raw = data[0] if isinstance(data[0], list) else data
-                    sd = {item["label"].lower(): float(item["score"]) for item in scores_raw if isinstance(item, dict) and item.get("label") is not None}
+                    sd = {
+                        str(item.get("label", "")).lower(): float(item.get("score", 0.0))
+                        for item in scores_raw
+                        if isinstance(item, dict)
+                    }
                     pos = sd.get("positive", 0.0)
                     neg = sd.get("negative", 0.0)
                     net = pos - neg
@@ -574,7 +588,7 @@ def _score_headline_with_finbert(headline: str, hf_token: str) -> tuple[float, s
     return None
 
 
-def _score_headline_with_vader(headline: str) -> tuple[float, str] | None:
+def _score_headline_with_vader(headline: str):
     if not headline or not _VADER_OK:
         return None
     try:
@@ -586,11 +600,8 @@ def _score_headline_with_vader(headline: str) -> tuple[float, str] | None:
 
 
 def fetch_news_sentiment(ticker: str, company_name: str, hf_token: str) -> dict:
-    """
-    Full pipeline: gnews headlines → per-headline FinBERT scoring → VADER fallback.
-    Returns richer fields so the dashboard can show multiple headlines and a multiplier.
-    """
-    _empty = {
+    """Fetch relevant headlines, score them one by one, and return display-ready fields."""
+    empty = {
         "news_score": 0.0,
         "news_sentiment": "NEUTRAL",
         "news_headline": None,
@@ -602,7 +613,7 @@ def fetch_news_sentiment(ticker: str, company_name: str, hf_token: str) -> dict:
 
     headlines = _fetch_news_headlines(ticker, company_name)
     if not headlines:
-        return _empty
+        return empty
 
     scored = []
     finbert_used = False
@@ -616,36 +627,25 @@ def fetch_news_sentiment(ticker: str, company_name: str, hf_token: str) -> dict:
             scored.append((headline, result[0], result[1]))
 
     if not scored:
-        return {**_empty, "news_headlines": headlines, "news_count": len(headlines), "news_headline": headlines[0]}
+        return {**empty, "news_headlines": headlines, "news_count": len(headlines), "news_headline": headlines[0]}
 
+    scored.sort(key=lambda item: abs(item[1]), reverse=True)
+    ordered_headlines = [h for h, _, _ in scored]
     avg_score = round(float(sum(item[1] for item in scored) / len(scored)), 3)
     sentiment = _label_from_score(avg_score)
     multiplier = _news_multiplier_from_score(avg_score)
-    headline_payload = [
-        {"headline": h, "score": s, "label": l}
-        for h, s, l in scored
-    ]
-    if len(headline_payload) < len(headlines):
-        seen = {item["headline"] for item in headline_payload}
-        for h in headlines:
-            if h not in seen:
-                headline_payload.append({"headline": h, "score": None, "label": None})
 
     return {
         "news_score": avg_score,
         "news_sentiment": sentiment,
-        "news_headline": headlines[0],
-        "news_headlines": headline_payload,
-        "news_count": len(headlines),
+        "news_headline": ordered_headlines[0],
+        "news_headlines": ordered_headlines,
+        "news_count": len(ordered_headlines),
         "news_multiplier": multiplier,
         "news_source": "finbert" if finbert_used else ("vader" if _VADER_OK else "headlines_only"),
         "news_alert": False,
     }
 
-# ─────────────────────────────────────────────
-#  SIGNAL STREAK
-#  One DB query before the main loop; O(1) per ticker.
-# ─────────────────────────────────────────────
 
 def get_signal_streaks(today: str) -> dict[str, int]:
     """
@@ -1055,13 +1055,10 @@ def run():
                 )
             else:
                 news = {
-                    "news_score": 0.0,
-                    "news_sentiment": "NEUTRAL",
-                    "news_headline": None,
-                    "news_headlines": [],
-                    "news_count": 0,
-                    "news_multiplier": 1.0,
-                    "news_alert": False,
+                    "news_score":     None,
+                    "news_sentiment": None,
+                    "news_headline":  None,
+                    "news_alert":     False,
                 }
 
             # ── Signal streak (previous days + today = total)
@@ -1109,26 +1106,13 @@ def run():
                 debt_equity       = fund.get("debt_equity"),
                 revenue_growth    = fund.get("revenue_growth"),
                 fundamental_flag  = fund.get("fundamental_flag"),
-                # Additional fundamental fields from yfinance
-                de_ratio          = fund.get("debt_equity"),
-                sector            = fund.get("sector"),
-                market_cap_cr     = fund.get("market_cap_cr"),
-                roe               = fund.get("roe"),
-                fundamental_score = fund.get("fundamental_score", 50),
-                fundamental_warnings = json.dumps([] if fund.get("fundamental_flag") in (None, "", "OK", "DATA_UNAVAILABLE") else [x.strip() for x in str(fund.get("fundamental_flag", "")).split(',') if x.strip()]),
                 # News
                 news_score        = news.get("news_score"),
                 news_sentiment    = news.get("news_sentiment"),
                 news_headline     = news.get("news_headline"),
                 news_alert        = bool(news.get("news_alert", False)),
-                # Dashboard/schema aliases for compatibility
-                news_label        = (news.get("news_sentiment") or "NEUTRAL").lower(),
-                news_headlines    = json.dumps(sanitize_for_json(news.get("news_headlines") or ([news.get("news_headline")] if news.get("news_headline") else []))),
-                news_multiplier   = float(news.get("news_multiplier", 1.0)),
-                news_count        = int(news.get("news_count", 1 if news.get("news_headline") else 0)),
                 # Streak
                 signal_streak     = streak_today,
-                streak            = streak_today,
                 **ctx,
             )
 
@@ -1196,9 +1180,6 @@ def run():
             "total_sells":           breadth["sell_count"],
             "breadth_ratio":         breadth["breadth_ratio"],
             "breadth_label":         breadth["breadth_label"],
-            "breadth_buys":          breadth["buy_count"],
-            "breadth_sells":         breadth["sell_count"],
-            "breadth_neutral":       max(0, len(ALL_TICKERS) - breadth["buy_count"] - breadth["sell_count"]),
         })).execute()
     except Exception as e:
         print(f"  ⚠️  Meta upsert failed: {e}")
