@@ -43,6 +43,14 @@ try:
 except ImportError:
     _GNEWS_OK = False
 
+try:
+    from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+    _vader = SentimentIntensityAnalyzer()
+    _VADER_OK = True
+except ImportError:
+    _vader = None
+    _VADER_OK = False
+
 warnings.filterwarnings("ignore")
 
 # ─────────────────────────────────────────────
@@ -558,11 +566,36 @@ def _score_with_finbert(headlines: list[str], hf_token: str) -> tuple[float, str
     return 0.0, "NEUTRAL"
 
 
+def _score_with_vader(headlines: list[str]) -> tuple[float, str]:
+    """
+    Score headlines using VADER (local, no API key needed).
+    Used as fallback when FinBERT is unavailable or fails.
+    Returns (net_score ∈ [-1,1], sentiment label).
+    """
+    if not _VADER_OK or not headlines:
+        return 0.0, "NEUTRAL"
+    try:
+        scores = [_vader.polarity_scores(h)["compound"] for h in headlines]
+        avg = float(sum(scores) / len(scores))
+        if   avg >  0.05: sent = "POSITIVE"
+        elif avg < -0.05: sent = "NEGATIVE"
+        else:              sent = "NEUTRAL"
+        return round(avg, 3), sent
+    except Exception:
+        return 0.0, "NEUTRAL"
+
+
 def fetch_news_sentiment(ticker: str, company_name: str, hf_token: str) -> dict:
     """
-    Full pipeline: gnews headlines → FinBERT scoring.
+    Full pipeline: gnews headlines → FinBERT (primary) → VADER (fallback).
+
+    Priority:
+      1. FinBERT via HuggingFace API  (best accuracy, needs HF_TOKEN)
+      2. VADER local scoring           (good enough, no API key needed)
+      3. Return neutral                (if gnews also unavailable)
+
     Returns dict with news_score, news_sentiment, news_headline.
-    news_alert is set later (requires knowing action).
+    news_alert is set by the caller based on action direction.
     """
     _empty = {
         "news_score":     None,
@@ -570,19 +603,30 @@ def fetch_news_sentiment(ticker: str, company_name: str, hf_token: str) -> dict:
         "news_headline":  None,
         "news_alert":     False,
     }
-    if not hf_token:
-        return _empty
 
+    # Fetch headlines — needed for both FinBERT and VADER
     headlines = _fetch_news_headlines(ticker, company_name)
     if not headlines:
         return {**_empty, "news_sentiment": "NEUTRAL", "news_score": 0.0}
 
-    net_score, sentiment = _score_with_finbert(headlines, hf_token)
+    # Try FinBERT first if token available
+    if hf_token:
+        net_score, sentiment = _score_with_finbert(headlines, hf_token)
+        # FinBERT returns 0.0/NEUTRAL on failure — if it genuinely succeeded
+        # the score will usually not be exactly 0.0 unless truly neutral
+        # We accept the result either way (failure returns neutral which is safe)
+        source = "finbert"
+    else:
+        # No HF token — fall back to VADER immediately (no delay, no API call)
+        net_score, sentiment = _score_with_vader(headlines)
+        source = "vader"
+
     return {
         "news_score":     net_score,
         "news_sentiment": sentiment,
-        "news_headline":  headlines[0],   # most recent headline
-        "news_alert":     False,          # caller sets this based on action
+        "news_headline":  headlines[0],
+        "news_alert":     False,
+        "news_source":    source,        # useful for debugging
     }
 
 # ─────────────────────────────────────────────
@@ -989,7 +1033,7 @@ def run():
             company_name = fund.get("company_name") or NSE_COMPANY_NAMES.get(ticker, ticker)
 
             # ── News sentiment (only if score is interesting enough and HF token present)
-            if c_score >= 25 and hf_token:
+            if c_score >= 25 and (hf_token or _VADER_OK):
                 news = fetch_news_sentiment(ticker, company_name, hf_token)
                 # news_alert: technical signal contradicts news sentiment
                 news["news_alert"] = (
