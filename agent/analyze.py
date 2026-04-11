@@ -45,10 +45,8 @@ except ImportError:
 
 try:
     from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-    _vader = SentimentIntensityAnalyzer()
     _VADER_OK = True
 except ImportError:
-    _vader = None
     _VADER_OK = False
 
 warnings.filterwarnings("ignore")
@@ -510,18 +508,34 @@ def _fetch_news_headlines(ticker: str, company_name: str, n: int = 5) -> list[st
         return []
 
 
-def _score_with_finbert(headlines: list[str], hf_token: str) -> tuple[float, str]:
-    """
-    Score concatenated headlines with FinBERT via HuggingFace Inference API.
-    Returns (net_score ∈ [-1,1], sentiment ∈ {POSITIVE, NEUTRAL, NEGATIVE}).
-    """
-    if not headlines or not hf_token:
-        return 0.0, "NEUTRAL"
+def _label_from_score(score: float) -> str:
+    if score >= 0.12:
+        return "POSITIVE"
+    if score <= -0.12:
+        return "NEGATIVE"
+    return "NEUTRAL"
 
-    text = ". ".join(headlines)[:512]
+
+def _news_multiplier_from_score(score: float) -> float:
+    if score >= 0.35:
+        return 1.15
+    if score >= 0.12:
+        return 1.08
+    if score <= -0.35:
+        return 0.85
+    if score <= -0.12:
+        return 0.92
+    return 1.00
+
+
+def _score_headline_with_finbert(headline: str, hf_token: str) -> tuple[float, str] | None:
+    """Score one headline with FinBERT. Returns None if the API call fails."""
+    if not headline or not hf_token:
+        return None
+
     headers = {
         "Authorization": f"Bearer {hf_token}",
-        "Content-Type":  "application/json",
+        "Content-Type": "application/json",
     }
 
     for attempt in range(3):
@@ -529,30 +543,25 @@ def _score_with_finbert(headlines: list[str], hf_token: str) -> tuple[float, str
             resp = requests.post(
                 HF_FINBERT_URL,
                 headers=headers,
-                json={"inputs": text},
+                json={"inputs": headline[:512]},
                 timeout=25,
             )
             if resp.status_code == 200:
                 data = resp.json()
-                # Format: [[{label, score}, {label, score}, {label, score}]]
                 if isinstance(data, list) and data:
                     scores_raw = data[0] if isinstance(data[0], list) else data
-                    sd = {item["label"].lower(): item["score"] for item in scores_raw}
+                    sd = {item["label"].lower(): float(item["score"]) for item in scores_raw if isinstance(item, dict) and item.get("label") is not None}
                     pos = sd.get("positive", 0.0)
                     neg = sd.get("negative", 0.0)
-                    neu = sd.get("neutral",  0.0)
                     net = pos - neg
-                    if   pos > neg and pos > neu: sent = "POSITIVE"
-                    elif neg > pos and neg > neu: sent = "NEGATIVE"
-                    else:                          sent = "NEUTRAL"
-                    return round(net, 3), sent
-
-            elif resp.status_code == 503:
-                # Model cold-starting; wait and retry
-                wait = min(float(resp.json().get("estimated_time", 20)), 30)
-                if attempt < 2:
-                    time.sleep(wait)
-                    continue
+                    return round(net, 3), _label_from_score(net)
+            elif resp.status_code == 503 and attempt < 2:
+                try:
+                    wait = min(float(resp.json().get("estimated_time", 20)), 30)
+                except Exception:
+                    wait = 10
+                time.sleep(wait)
+                continue
             else:
                 break
         except requests.Timeout:
@@ -562,71 +571,75 @@ def _score_with_finbert(headlines: list[str], hf_token: str) -> tuple[float, str
             break
         except Exception:
             break
+    return None
 
-    return 0.0, "NEUTRAL"
 
-
-def _score_with_vader(headlines: list[str]) -> tuple[float, str]:
-    """
-    Score headlines using VADER (local, no API key needed).
-    Used as fallback when FinBERT is unavailable or fails.
-    Returns (net_score ∈ [-1,1], sentiment label).
-    """
-    if not _VADER_OK or not headlines:
-        return 0.0, "NEUTRAL"
+def _score_headline_with_vader(headline: str) -> tuple[float, str] | None:
+    if not headline or not _VADER_OK:
+        return None
     try:
-        scores = [_vader.polarity_scores(h)["compound"] for h in headlines]
-        avg = float(sum(scores) / len(scores))
-        if   avg >  0.05: sent = "POSITIVE"
-        elif avg < -0.05: sent = "NEGATIVE"
-        else:              sent = "NEUTRAL"
-        return round(avg, 3), sent
+        analyzer = SentimentIntensityAnalyzer()
+        compound = float(analyzer.polarity_scores(headline).get("compound", 0.0))
+        return round(compound, 3), _label_from_score(compound)
     except Exception:
-        return 0.0, "NEUTRAL"
+        return None
 
 
 def fetch_news_sentiment(ticker: str, company_name: str, hf_token: str) -> dict:
     """
-    Full pipeline: gnews headlines → FinBERT (primary) → VADER (fallback).
-
-    Priority:
-      1. FinBERT via HuggingFace API  (best accuracy, needs HF_TOKEN)
-      2. VADER local scoring           (good enough, no API key needed)
-      3. Return neutral                (if gnews also unavailable)
-
-    Returns dict with news_score, news_sentiment, news_headline.
-    news_alert is set by the caller based on action direction.
+    Full pipeline: gnews headlines → per-headline FinBERT scoring → VADER fallback.
+    Returns richer fields so the dashboard can show multiple headlines and a multiplier.
     """
     _empty = {
-        "news_score":     None,
-        "news_sentiment": None,
-        "news_headline":  None,
-        "news_alert":     False,
+        "news_score": 0.0,
+        "news_sentiment": "NEUTRAL",
+        "news_headline": None,
+        "news_headlines": [],
+        "news_count": 0,
+        "news_multiplier": 1.0,
+        "news_alert": False,
     }
 
-    # Fetch headlines — needed for both FinBERT and VADER
     headlines = _fetch_news_headlines(ticker, company_name)
     if not headlines:
-        return {**_empty, "news_sentiment": "NEUTRAL", "news_score": 0.0}
+        return _empty
 
-    # Try FinBERT first if token available
-    if hf_token:
-        net_score, sentiment = _score_with_finbert(headlines, hf_token)
-        # FinBERT returns 0.0/NEUTRAL on failure — if it genuinely succeeded
-        # the score will usually not be exactly 0.0 unless truly neutral
-        # We accept the result either way (failure returns neutral which is safe)
-        source = "finbert"
-    else:
-        # No HF token — fall back to VADER immediately (no delay, no API call)
-        net_score, sentiment = _score_with_vader(headlines)
-        source = "vader"
+    scored = []
+    finbert_used = False
+    for headline in headlines:
+        result = _score_headline_with_finbert(headline, hf_token) if hf_token else None
+        if result is not None:
+            finbert_used = True
+        else:
+            result = _score_headline_with_vader(headline)
+        if result is not None:
+            scored.append((headline, result[0], result[1]))
+
+    if not scored:
+        return {**_empty, "news_headlines": headlines, "news_count": len(headlines), "news_headline": headlines[0]}
+
+    avg_score = round(float(sum(item[1] for item in scored) / len(scored)), 3)
+    sentiment = _label_from_score(avg_score)
+    multiplier = _news_multiplier_from_score(avg_score)
+    headline_payload = [
+        {"headline": h, "score": s, "label": l}
+        for h, s, l in scored
+    ]
+    if len(headline_payload) < len(headlines):
+        seen = {item["headline"] for item in headline_payload}
+        for h in headlines:
+            if h not in seen:
+                headline_payload.append({"headline": h, "score": None, "label": None})
 
     return {
-        "news_score":     net_score,
+        "news_score": avg_score,
         "news_sentiment": sentiment,
-        "news_headline":  headlines[0],
-        "news_alert":     False,
-        "news_source":    source,        # useful for debugging
+        "news_headline": headlines[0],
+        "news_headlines": headline_payload,
+        "news_count": len(headlines),
+        "news_multiplier": multiplier,
+        "news_source": "finbert" if finbert_used else ("vader" if _VADER_OK else "headlines_only"),
+        "news_alert": False,
     }
 
 # ─────────────────────────────────────────────
@@ -1033,7 +1046,7 @@ def run():
             company_name = fund.get("company_name") or NSE_COMPANY_NAMES.get(ticker, ticker)
 
             # ── News sentiment (only if score is interesting enough and HF token present)
-            if c_score >= 25 and (hf_token or _VADER_OK):
+            if c_score >= 25 and hf_token:
                 news = fetch_news_sentiment(ticker, company_name, hf_token)
                 # news_alert: technical signal contradicts news sentiment
                 news["news_alert"] = (
@@ -1042,10 +1055,13 @@ def run():
                 )
             else:
                 news = {
-                    "news_score":     None,
-                    "news_sentiment": None,
-                    "news_headline":  None,
-                    "news_alert":     False,
+                    "news_score": 0.0,
+                    "news_sentiment": "NEUTRAL",
+                    "news_headline": None,
+                    "news_headlines": [],
+                    "news_count": 0,
+                    "news_multiplier": 1.0,
+                    "news_alert": False,
                 }
 
             # ── Signal streak (previous days + today = total)
@@ -1106,10 +1122,10 @@ def run():
                 news_headline     = news.get("news_headline"),
                 news_alert        = bool(news.get("news_alert", False)),
                 # Dashboard/schema aliases for compatibility
-                news_label        = (news.get("news_sentiment") or "NEUTRAL").lower() if news.get("news_sentiment") else "neutral",
-                news_headlines    = json.dumps([news.get("news_headline")] if news.get("news_headline") else []),
-                news_multiplier   = 1.0,
-                news_count        = 1 if news.get("news_headline") else 0,
+                news_label        = (news.get("news_sentiment") or "NEUTRAL").lower(),
+                news_headlines    = json.dumps(sanitize_for_json(news.get("news_headlines") or ([news.get("news_headline")] if news.get("news_headline") else []))),
+                news_multiplier   = float(news.get("news_multiplier", 1.0)),
+                news_count        = int(news.get("news_count", 1 if news.get("news_headline") else 0)),
                 # Streak
                 signal_streak     = streak_today,
                 streak            = streak_today,
