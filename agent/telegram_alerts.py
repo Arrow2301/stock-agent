@@ -26,7 +26,6 @@ def send_message(text: str, parse_mode: str = "HTML") -> bool:
         print(f"  ⚠️ Telegram exception: {e}")
         return False
 
-
 def send_morning_summary(buy_recs: list[dict], sell_recs: list[dict], meta: dict, breadth: dict):
     today = datetime.today().strftime("%A, %d %B %Y")
     regime = meta.get("market_regime", "UNKNOWN")
@@ -41,17 +40,11 @@ def send_morning_summary(buy_recs: list[dict], sell_recs: list[dict], meta: dict
     if buy_recs:
         lines.append("🟢 <b>TOP BUYS</b>")
         for i, r in enumerate(buy_recs[:3], 1):
-            price = float(r.get("price", 0) or 0)
-            stop_loss = float(r.get("stop_loss", 0) or 0)
-            target = float(r.get("target", 0) or 0)
-            sl_pct = ((stop_loss - price) / price * 100) if price else 0
-            target_pct = ((target - price) / price * 100) if price else 0
-
             lines.append(
                 f"{i}. <b>{r['ticker']}</b> — Score <b>{r.get('composite_score',0):.0f}</b>/100 | "
-                f"₹{price:,.0f} | "
-                f"SL ₹{stop_loss:,.0f} ({sl_pct:+.2f}%) | "
-                f"Target ₹{target:,.0f} ({target_pct:+.2f}%)"
+                f"₹{r.get('price',0):,.0f} | "
+                f"SL ₹{r.get('stop_loss',0):,.0f} ({((float(r.get('stop_loss',0)) - float(r.get('price',0))) / float(r.get('price',1))) * 100:+.2f}%) | "
+                f"Target ₹{r.get('target',0):,.0f} ({((float(r.get('target',0)) - float(r.get('price',0))) / float(r.get('price',1))) * 100:+.2f}%)"
             )
     send_message("\n".join(lines))
 
