@@ -798,14 +798,23 @@ def _build_telegram_message(records: list[dict], regime: str,
             ne   = news_e.get(ns, "") if ns else ""
             flag = " ⚠️ Bad news!" if r.get("news_alert") else ""
 
-            price = r.get("price")   or 0
-            sl    = r.get("stop_loss") or 0
-            tgt   = r.get("target")   or 0
+            price = float(r.get("price") or 0)
+            sl    = float(r.get("stop_loss") or 0)
+            tgt   = float(r.get("target") or 0)
+
+            sl_pct  = ((sl - price) / price * 100) if price else 0
+            tgt_pct = ((tgt - price) / price * 100) if price else 00
+          
             lines.append(
                 f"\n{idx}. <b>{r['ticker']}</b>{streak_str} — "
                 f"{r.get('composite_score', 0):.0f}/100 ({r.get('score_label','')})"
             )
-            lines.append(f"   ₹{price:,.2f} | SL ₹{sl:,.2f} | Target ₹{tgt:,.2f}")
+            lines.append(
+                f"   ₹{price:,.2f} | "
+                f"SL ₹{sl:,.2f} ({sl_pct:+.2f}%) | "
+                f"Target ₹{tgt:,.2f} ({tgt_pct:+.2f}%)"
+            )
+          
             lines.append(f"   {r.get('active_strategies', '')}")
             if ne:
                 headline = r.get("news_headline") or ""
