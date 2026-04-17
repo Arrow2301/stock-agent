@@ -1,19 +1,29 @@
 name: Midday Alert Checker
+
 on:
   schedule:
-    - cron: "30 7 * * 1-5"   # 1:00 PM IST
+    # Run 1: 05:30 UTC = ~11:00-11:30 AM IST (accounting for GitHub delay)
+    - cron: "30 5 * * 1-5"
+    # Run 2: 08:30 UTC = ~2:30-3:00 PM IST (before 3:30 PM market close)
+    - cron: "30 8 * * 1-5"
+
   workflow_dispatch:
+
 jobs:
   check-alerts:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
+
       - run: pip install -r requirements.txt
+
       - name: Run midday alert checker
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
