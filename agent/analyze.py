@@ -118,7 +118,7 @@ DEFAULT_PARAMS = {
     "ATR_STOP_BUFFER":    0.50,
     "ATR_TARGET_BUFFER":  0.50,
     "MAX_RISK_ATR":       3.00,
-    "MIN_WEIGHTED_SCORE": 0.08,
+    "MIN_WEIGHTED_SCORE": 0.30,
     "W_STRATEGY":         40,
     "W_RSI":              20,
     "W_VOLUME":           15,
