@@ -317,8 +317,16 @@ def get_strategies(p: dict) -> dict:
 #  histograms work without extra DB columns.
 # ─────────────────────────────────────────────
 
-def backtest(df: pd.DataFrame, signals: pd.Series, p: dict) -> dict:
-    trades, reasons = [], []
+def backtest(df: pd.DataFrame, signals: pd.Series, p: dict, benchmark_close: pd.Series | None = None) -> dict:
+    """
+    Long-entry backtest using next-bar execution.
+
+    A signal that appears on day i is entered at day i+1 open, so the
+    strategy does not use the same candle's close/high/low to enter at an
+    already-known open. Only BUY signals are traded here; bearish signals are
+    treated elsewhere as EXIT signals, not short entries.
+    """
+    trades, reasons, bench_returns, rel_returns = [], [], [], []
     in_t, ep, entry_idx = False, 0.0, -1
     closes = df.Close.values
     highs  = df.High.values
@@ -328,25 +336,50 @@ def backtest(df: pd.DataFrame, signals: pd.Series, p: dict) -> dict:
     tgt_pct  = p["BT_TARGET_PCT"]
     max_hold = p["BT_MAX_HOLD"]
 
+    aligned_benchmark = None
+    if benchmark_close is not None and not benchmark_close.empty:
+        try:
+            aligned_benchmark = benchmark_close.reindex(df.index).ffill()
+        except Exception:
+            aligned_benchmark = None
+
+    def close_trade(exit_idx: int, gross_return: float, reason: str):
+        trades.append(gross_return)
+        reasons.append(reason)
+        if aligned_benchmark is not None and entry_idx >= 0:
+            try:
+                b_entry = float(aligned_benchmark.iloc[entry_idx])
+                b_exit  = float(aligned_benchmark.iloc[exit_idx])
+                if b_entry > 0 and math.isfinite(b_entry) and math.isfinite(b_exit):
+                    b_ret = (b_exit - b_entry) / b_entry * 100
+                    bench_returns.append(b_ret)
+                    rel_returns.append(gross_return - b_ret)
+            except Exception:
+                pass
+
     for i in range(1, len(df)):
+        # Enter at today's open only if yesterday produced a BUY signal.
+        if (not in_t) and int(signals.iloc[i - 1]) == 1 and opens[i] > 0:
+            ep, entry_idx, in_t = opens[i], i, True
+
         if in_t:
             sl_px  = ep * (1 - sl_pct  / 100)
             tgt_px = ep * (1 + tgt_pct / 100)
             if lows[i] <= sl_px:
-                trades.append((sl_px  - ep) / ep * 100); reasons.append("sl");      in_t = False
+                close_trade(i, (sl_px  - ep) / ep * 100, "sl");      in_t = False
             elif highs[i] >= tgt_px:
-                trades.append((tgt_px - ep) / ep * 100); reasons.append("target");  in_t = False
+                close_trade(i, (tgt_px - ep) / ep * 100, "target");  in_t = False
             elif i >= entry_idx + max_hold:
-                trades.append((closes[i] - ep) / ep * 100); reasons.append("timeout"); in_t = False
-        if signals.iloc[i] == 1 and not in_t:
-            ep, entry_idx, in_t = opens[i], i, True
+                close_trade(i, (closes[i] - ep) / ep * 100, "timeout"); in_t = False
 
     if not trades:
         return dict(
             win_rate=0, avg_return=0, median_return=0, trades=0,
             profit_factor=0, max_drawdown=0,
             sl_exits=0, target_exits=0, timeout_exits=0,
-            trade_returns=[],
+            trade_returns=[], benchmark_avg_return=0,
+            avg_relative_return=0, benchmark_outperformance_rate=0,
+            execution="next_open",
         )
 
     wins   = [t for t in trades if t > 0]
@@ -356,6 +389,11 @@ def backtest(df: pd.DataFrame, signals: pd.Series, p: dict) -> dict:
     eq     = np.cumsum(trades)
     peak   = np.maximum.accumulate(eq)
     max_dd = round(float(abs((eq - peak).min())), 2)
+
+    outperformance_rate = (
+        round(sum(1 for r in rel_returns if r > 0) / len(rel_returns) * 100, 1)
+        if rel_returns else 0
+    )
 
     return dict(
         win_rate      = round(len(wins) / len(trades) * 100, 1),
@@ -368,6 +406,10 @@ def backtest(df: pd.DataFrame, signals: pd.Series, p: dict) -> dict:
         target_exits  = reasons.count("target"),
         timeout_exits = reasons.count("timeout"),
         trade_returns = [round(t, 3) for t in trades],
+        benchmark_avg_return = round(float(np.mean(bench_returns)), 2) if bench_returns else 0,
+        avg_relative_return  = round(float(np.mean(rel_returns)), 2) if rel_returns else 0,
+        benchmark_outperformance_rate = outperformance_rate,
+        execution="next_open",
     )
 
 # ─────────────────────────────────────────────
@@ -476,800 +518,863 @@ def fetch_fundamentals(ticker: str) -> dict:
             "market_cap_cr":     mc_cr,
             "roe":               roe_val,
             "fundamental_score": f_score,
-            "fundamental_flag":  ", ".join(flags) if flags else "OK",
+            "fundamental_flag":  "OK" if not flags else ",".join(flags),
         }
-    except Exception:
+
+    except Exception as e:
+        print(f"    ⚠️ fundamentals failed for {ticker}: {e}")
         return _default
+
+def fundamental_multiplier(fundamental_score: float | None, warnings: str | None = None) -> float:
+    """
+    Converts fundamental_score into a controlled score multiplier.
+    This intentionally has a small range so technicals remain primary.
+    """
+    if fundamental_score is None:
+        return 1.00
+    try:
+        fs = float(fundamental_score)
+    except Exception:
+        return 1.00
+
+    if fs >= 80:
+        mult = 1.10
+    elif fs >= 65:
+        mult = 1.05
+    elif fs >= 45:
+        mult = 1.00
+    elif fs >= 30:
+        mult = 0.94
+    else:
+        mult = 0.88
+
+    if warnings and warnings not in ("OK", "DATA_UNAVAILABLE"):
+        mult -= 0.03
+
+    return round(max(0.85, min(1.12, mult)), 3)
 
 # ─────────────────────────────────────────────
 #  NEWS SENTIMENT
-#  gnews  →  headlines  →  FinBERT (HF API)
-#  Only runs when HF_TOKEN env var is set.
 # ─────────────────────────────────────────────
 
-def _normalize_news_text(text: str) -> str:
-    text = (text or "").lower()
-    text = re.sub(r"[^a-z0-9&+ ]+", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+def clean_headline(h: str) -> str:
+    return re.sub(r"\s+", " ", h or "").strip()[:240]
 
-
-def _company_aliases(ticker: str, company_name: str) -> list[str]:
-    raw = [ticker or "", company_name or ""]
-    cleaned = company_name or ""
-    for suffix in [" Limited", " Ltd", " Ltd.", " Corporation", " Corp", " Company"]:
-        if cleaned.endswith(suffix):
-            raw.append(cleaned[: -len(suffix)])
-
-    aliases: list[str] = []
-    seen: set[str] = set()
-    for item in raw:
-        norm = _normalize_news_text(item.replace("NSE:", "").replace("BSE:", ""))
-        if norm and len(norm) >= 3 and norm not in seen:
-            aliases.append(norm)
-            seen.add(norm)
-        compact = norm.replace(" ", "")
-        if compact and len(compact) >= 4 and compact not in seen:
-            aliases.append(compact)
-            seen.add(compact)
-    return aliases
-
-
-def _headline_is_relevant(headline: str, ticker: str, company_name: str) -> bool:
-    norm = _normalize_news_text(headline)
-    if not norm:
-        return False
-    aliases = _company_aliases(ticker, company_name)
-    if not aliases:
-        return False
-    compact_norm = norm.replace(" ", "")
-    return any(alias in norm or alias.replace(" ", "") in compact_norm for alias in aliases)
-
-
-def _fetch_news_headlines(ticker: str, company_name: str, n: int = 5) -> list[str]:
-    """Fetch recent headlines via GNews and keep only clearly relevant ones."""
+def fetch_news_headlines(company_name: str, ticker: str, max_articles: int = 5) -> list[str]:
     if not _GNEWS_OK:
         return []
-
-    queries: list[str] = []
-    if company_name:
-        queries.extend([
-            f'"{company_name}" stock',
-            f'"{company_name}" share',
-            f'"{company_name}" news',
-        ])
-    queries.extend([
-        f'"{ticker}" NSE',
-        f'"{ticker}" stock',
-        f'"{ticker}" share',
-    ])
-
-    seen: set[str] = set()
-    kept: list[str] = []
     try:
-        gn = GNews(language="en", country="IN", period="7d", max_results=max(8, n * 2))
-        for query in queries:
-            for row in gn.get_news(query) or []:
-                headline = (row.get("title") or "").strip()
-                if len(headline) <= 10:
-                    continue
-                key = headline.lower()
-                if key in seen:
-                    continue
-                seen.add(key)
-                if _headline_is_relevant(headline, ticker, company_name):
-                    kept.append(headline)
-                    if len(kept) >= n:
-                        return kept
-        return kept[:n]
-    except Exception:
+        google_news = GNews(language="en", country="IN", period="7d", max_results=max_articles)
+        query       = f'"{company_name}" stock OR shares'
+        articles    = google_news.get_news(query)
+        headlines   = []
+        for a in articles[:max_articles]:
+            title = clean_headline(a.get("title", ""))
+            if title:
+                headlines.append(title)
+        return headlines
+    except Exception as e:
+        print(f"    ⚠️ news fetch failed for {ticker}: {e}")
         return []
 
+def hf_finbert_score(texts: list[str]) -> tuple[float, str, str]:
+    """
+    Returns score in [-1, +1], label, main headline.
+    Requires HF_TOKEN. Falls back to neutral if unavailable.
+    """
+        if not texts:
+        return 0.0, "neutral", ""
 
-def _label_from_score(score: float) -> str:
-    if score >= 0.12:
-        return "POSITIVE"
-    if score <= -0.12:
-        return "NEGATIVE"
-    return "NEUTRAL"
+    token = os.getenv("HF_TOKEN", "").strip()
+    if not token:
+        return fallback_news_sentiment(texts)
 
+    try:
+        headers = {"Authorization": f"Bearer {token}"}
+        payload = {"inputs": texts[:5]}
+        r = requests.post(HF_FINBERT_URL, headers=headers, json=payload, timeout=20)
 
-def _news_multiplier_from_score(score: float) -> float:
-    if score >= 0.35:
-        return 1.15
-    if score >= 0.12:
-        return 1.08
-    if score <= -0.35:
-        return 0.85
-    if score <= -0.12:
-        return 0.92
-    return 1.00
+        if r.status_code != 200:
+            print(f"    ⚠️ FinBERT HTTP {r.status_code}: {r.text[:120]}")
+            return fallback_news_sentiment(texts)
 
+        out = r.json()
 
-def _score_headline_with_finbert(headline: str, hf_token: str):
-    if not headline or not hf_token:
-        return None
-    headers = {
-        "Authorization": f"Bearer {hf_token}",
-        "Content-Type": "application/json",
-    }
-    for attempt in range(3):
-        try:
-            resp = requests.post(
-                HF_FINBERT_URL,
-                headers=headers,
-                json={"inputs": headline[:512]},
-                timeout=25,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                if isinstance(data, list) and data:
-                    scores_raw = data[0] if isinstance(data[0], list) else data
-                    sd = {
-                        str(item.get("label", "")).lower(): float(item.get("score", 0.0))
-                        for item in scores_raw
-                        if isinstance(item, dict)
-                    }
-                    pos = sd.get("positive", 0.0)
-                    neg = sd.get("negative", 0.0)
-                    net = pos - neg
-                    return round(net, 3), _label_from_score(net)
-            elif resp.status_code == 503 and attempt < 2:
-                try:
-                    wait = min(float(resp.json().get("estimated_time", 20)), 30)
-                except Exception:
-                    wait = 10
-                time.sleep(wait)
-                continue
+        scores = []
+        labels = []
+        for item in out:
+            if isinstance(item, list):
+                probs = {x.get("label", "").lower(): x.get("score", 0) for x in item}
+            elif isinstance(item, dict):
+                probs = {item.get("label", "").lower(): item.get("score", 0)}
             else:
-                break
-        except requests.Timeout:
-            if attempt < 2:
-                time.sleep(5)
                 continue
-            break
-        except Exception:
-            break
-    return None
 
+            pos = probs.get("positive", 0)
+            neg = probs.get("negative", 0)
+            neu = probs.get("neutral", 0)
+            sc = pos - neg
+            scores.append(sc)
 
-def _score_headline_with_vader(headline: str):
-    if not headline or not _VADER_OK:
-        return None
-    try:
-        analyzer = SentimentIntensityAnalyzer()
-        compound = float(analyzer.polarity_scores(headline).get("compound", 0.0))
-        return round(compound, 3), _label_from_score(compound)
-    except Exception:
-        return None
+            if pos >= max(neg, neu):
+                labels.append("positive")
+            elif neg >= max(pos, neu):
+                labels.append("negative")
+            else:
+                labels.append("neutral")
 
+        if not scores:
+            return fallback_news_sentiment(texts)
 
-def fetch_news_sentiment(ticker: str, company_name: str, hf_token: str) -> dict:
-    """Fetch relevant headlines, score them one by one, and return display-ready fields."""
-    empty = {
-        "news_score": 0.0,
-        "news_sentiment": "NEUTRAL",
-        "news_headline": None,
-        "news_headlines": [],
-        "news_count": 0,
-        "news_multiplier": 1.0,
-        "news_alert": False,
-    }
-
-    headlines = _fetch_news_headlines(ticker, company_name)
-    if not headlines:
-        return empty
-
-    scored = []
-    finbert_used = False
-    for headline in headlines:
-        result = _score_headline_with_finbert(headline, hf_token) if hf_token else None
-        if result is not None:
-            finbert_used = True
-        else:
-            result = _score_headline_with_vader(headline)
-        if result is not None:
-            scored.append((headline, result[0], result[1]))
-
-    if not scored:
-        return {**empty, "news_headlines": headlines, "news_count": len(headlines), "news_headline": headlines[0]}
-
-    scored.sort(key=lambda item: abs(item[1]), reverse=True)
-    ordered_headlines = [h for h, _, _ in scored]
-    avg_score = round(float(sum(item[1] for item in scored) / len(scored)), 3)
-    sentiment = _label_from_score(avg_score)
-    multiplier = _news_multiplier_from_score(avg_score)
-
-    return {
-        "news_score": avg_score,
-        "news_sentiment": sentiment,
-        "news_headline": ordered_headlines[0],
-        "news_headlines": ordered_headlines,
-        "news_count": len(ordered_headlines),
-        "news_multiplier": multiplier,
-        "news_source": "finbert" if finbert_used else ("vader" if _VADER_OK else "headlines_only"),
-        "news_alert": False,
-    }
-
-
-def get_signal_streaks(today: str) -> dict[str, int]:
-    """
-    Query the last 12 days of recommendations (excluding today).
-    Returns {ticker: consecutive_day_count_before_today}.
-    A ticker that had a BUY yesterday and the day before returns 2.
-    """
-    streaks: dict[str, int] = {}
-    try:
-        start = (datetime.today() - timedelta(days=14)).strftime("%Y-%m-%d")
-        res   = (
-            supabase.table("recommendations")
-            .select("date, ticker, action")
-            .gte("date", start)
-            .lt("date", today)
-            .order("date", desc=True)
-            .execute()
+        avg = float(np.mean(scores))
+        label = (
+            "positive" if avg > 0.15
+            else "negative" if avg < -0.15
+            else "neutral"
         )
-        if not res.data:
-            return streaks
-
-        df = (
-            pd.DataFrame(res.data)
-            .drop_duplicates(subset=["date", "ticker"])
-            .sort_values(["ticker", "date"], ascending=[True, False])
-        )
-
-        for ticker, grp in df.groupby("ticker"):
-            if grp.empty:
-                continue
-            last_action = grp.iloc[0]["action"]
-            streak = 0
-            for _, row in grp.iterrows():
-                if row["action"] == last_action:
-                    streak += 1
-                else:
-                    break
-            streaks[ticker] = streak
+        return round(avg, 3), label, texts[0]
 
     except Exception as e:
-        print(f"\n  ⚠️  Signal streak fetch failed: {e}")
+        print(f"    ⚠️ FinBERT failed: {e}")
+        return fallback_news_sentiment(texts)
 
-    return streaks
-
-# ─────────────────────────────────────────────
-#  MARKET BREADTH
-# ─────────────────────────────────────────────
-
-def compute_market_breadth(records: list[dict]) -> dict:
+def fallback_news_sentiment(texts: list[str]) -> tuple[float, str, str]:
     """
-    Summarises buy/sell ratio across today's signals.
-    Label ranges: ≥70% buy = VERY BULLISH … ≤30% buy = VERY BEARISH.
+    Lightweight fallback when HF_TOKEN is missing/unavailable.
+    Uses VADER if installed, else a simple financial keyword heuristic.
     """
-    buy_ct  = sum(1 for r in records if r.get("action") == "BUY")
-    sell_ct = sum(1 for r in records if r.get("action") == "SELL")
-    total   = buy_ct + sell_ct
+    joined = " ".join(texts[:5])
+    if _VADER_OK:
+        try:
+            analyzer = SentimentIntensityAnalyzer()
+            compound = analyzer.polarity_scores(joined).get("compound", 0.0)
+            label = "positive" if compound > 0.15 else "negative" if compound < -0.15 else "neutral"
+            return round(float(compound), 3), label, texts[0] if texts else ""
+        except Exception:
+            pass
 
-    if total == 0:
-        return {"buy_count": 0, "sell_count": 0, "breadth_ratio": 0.5, "breadth_label": "NEUTRAL"}
-
-    ratio = buy_ct / total
-    if   ratio >= 0.70: label = "VERY BULLISH"
-    elif ratio >= 0.55: label = "BULLISH"
-    elif ratio >= 0.45: label = "NEUTRAL"
-    elif ratio >= 0.30: label = "BEARISH"
-    else:               label = "VERY BEARISH"
-
-    return {
-        "buy_count":     buy_ct,
-        "sell_count":    sell_ct,
-        "breadth_ratio": round(ratio, 3),
-        "breadth_label": label,
-    }
-
-# ─────────────────────────────────────────────
-#  TELEGRAM
-#  Morning alert with top signals.
-#  Requires TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID env vars.
-# ─────────────────────────────────────────────
-
-def _build_telegram_message(records: list[dict], regime: str,
-                             breadth: dict, today: str) -> str:
-    regime_e = {"BULLISH": "🟢", "BEARISH": "🔴", "NEUTRAL": "🟡"}.get(regime, "⬜")
-    news_e   = {"POSITIVE": "🟢", "NEGATIVE": "🔴", "NEUTRAL": "🟡"}
-
-    lines = [
-        f"🇮🇳 <b>Indian Stock Agent — {today}</b>",
-        f"Market Regime  : {regime_e} {regime}",
-        f"Market Breadth : {breadth.get('breadth_label','?')} "
-        f"({breadth.get('buy_count',0)} buys / {breadth.get('sell_count',0)} sells)",
-        "",
+    pos_words = [
+        "beats", "beat", "profit rises", "surges", "rally", "upgrade", "wins order",
+        "record high", "strong", "growth", "expands", "raises guidance", "dividend",
+    ]
+    neg_words = [
+        "misses", "loss", "falls", "plunges", "downgrade", "probe", "fraud",
+        "weak", "declines", "default", "resigns", "layoff", "tax notice",
     ]
 
-    buys  = sorted([r for r in records if r.get("action") == "BUY"],
-                   key=lambda x: x.get("composite_score", 0), reverse=True)[:5]
-    sells = sorted([r for r in records if r.get("action") == "SELL"],
-                   key=lambda x: x.get("composite_score", 0), reverse=True)[:3]
+    text = joined.lower()
+    pos = sum(1 for w in pos_words if w in text)
+    neg = sum(1 for w in neg_words if w in text)
 
-    if buys:
-        lines.append("🟢 <b>BUY SIGNALS</b>")
-        for idx, r in enumerate(buys, 1):
-            streak = r.get("signal_streak", 1)
-            streak_str = f" 🔥{streak}d" if streak >= 2 else ""
-            ns   = r.get("news_sentiment")
-            ne   = news_e.get(ns, "") if ns else ""
-            flag = " ⚠️ Bad news!" if r.get("news_alert") else ""
+    if pos == neg == 0:
+        return 0.0, "neutral", texts[0] if texts else ""
 
-            price = float(r.get("price") or 0)
-            sl    = float(r.get("stop_loss") or 0)
-            tgt   = float(r.get("target") or 0)
+    score = (pos - neg) / max(1, pos + neg)
+    label = "positive" if score > 0.15 else "negative" if score < -0.15 else "neutral"
+    return round(float(score), 3), label, texts[0] if texts else ""
 
-            sl_pct  = ((sl - price) / price * 100) if price else 0
-            tgt_pct = ((tgt - price) / price * 100) if price else 00
-          
-            lines.append(
-                f"\n{idx}. <b>{r['ticker']}</b>{streak_str} — "
-                f"{r.get('composite_score', 0):.0f}/100 ({r.get('score_label','')})"
-            )
-            lines.append(
-                f"   ₹{price:,.2f} | "
-                f"SL ₹{sl:,.2f} ({sl_pct:+.2f}%) | "
-                f"Target ₹{tgt:,.2f} ({tgt_pct:+.2f}%)"
-            )
-          
-            lines.append(f"   {r.get('active_strategies', '')}")
-            if ne:
-                headline = r.get("news_headline") or ""
-                short_hl = (headline[:75] + "…") if len(headline) > 75 else headline
-                lines.append(f"   News: {ne} {ns}{flag}")
-                if short_hl:
-                    lines.append(f"   📰 {short_hl}")
-            fund_flag = r.get("fundamental_flag") or ""
-            if fund_flag and fund_flag not in ("OK", "DATA_UNAVAILABLE", ""):
-                lines.append(f"   ⚠️ Fundamentals: {fund_flag}")
-
-    if sells:
-        lines.append("\n🔴 <b>SELL / EXIT SIGNALS</b>")
-        for idx, r in enumerate(sells, 1):
-            lines.append(
-                f"\n{idx}. <b>{r['ticker']}</b> — "
-                f"{r.get('composite_score', 0):.0f}/100 | ₹{r.get('price', 0):,.2f}"
-            )
-            lines.append(f"   {r.get('active_strategies', '')}")
-
-    lines.append(f"\n📊 {len(records)} total signals | {today}")
-    lines.append("⚠️ Paper trading only. Not financial advice.")
-    return "\n".join(lines)
-
-
-def send_telegram_alert(bot_token: str, chat_id: str, message: str) -> bool:
-    """POST message to Telegram Bot API. Returns True on success."""
-    if not bot_token or not chat_id:
-        return False
+def news_multiplier(news_score: float | None, news_label: str | None = None) -> float:
+    """
+    Converts news_score into a controlled score multiplier.
+    Positive news can boost the final score slightly; negative news
+    can reduce it meaningfully.
+    """
+    if news_score is None:
+        return 1.00
     try:
-        resp = requests.post(
-            f"https://api.telegram.org/bot{bot_token}/sendMessage",
-            json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"},
-            timeout=15,
-        )
-        if resp.status_code == 200:
-            print("  📱 Telegram alert sent ✅")
-            return True
-        print(f"  ⚠️  Telegram error {resp.status_code}: {resp.text[:100]}")
-        return False
-    except Exception as e:
-        print(f"  ⚠️  Telegram failed: {e}")
-        return False
-
-# ─────────────────────────────────────────────
-#  WEIGHTED VOTE + COMPOSITE SCORE
-# ─────────────────────────────────────────────
-
-def weighted_vote(today_sigs: dict, bt_results: dict, action: str) -> tuple[float, dict]:
-    weights: dict[str, float] = {}
-    for name, bt in bt_results.items():
-        wr   = bt.get("win_rate", 50) / 100
-        n    = bt.get("trades", 0)
-        conf = min(n / 8.0, 1.0)
-        weights[name] = round(wr * conf, 3)
-
-    total_w  = sum(weights.values()) or 1e-9
-    target_v = 1 if action == "BUY" else -1
-    signal_w = sum(weights.get(name, 0) for name, v in today_sigs.items() if v == target_v)
-    return round(signal_w / total_w, 3), weights
-
-
-def composite_score(today_sigs: dict, bt_results: dict, ctx: dict,
-                    regime_sc: float, action: str, p: dict) -> tuple[float, dict]:
-    w_ratio, _ = weighted_vote(today_sigs, bt_results, action)
-    strat_pts  = round(w_ratio * p["W_STRATEGY"], 2)
-
-    r = ctx.get("rsi")
-    if r is None:
-        rsi_pts = 0.0
-    elif action == "BUY":
-        rsi_pts = max(0.0, min((60 - r) / 40 * p["W_RSI"],   p["W_RSI"]))
-    else:
-        rsi_pts = max(0.0, min((r - 40) / 40 * p["W_RSI"],   p["W_RSI"]))
-
-    avg_vol   = ctx.get("avg_volume") or 0
-    cur_vol   = ctx.get("volume")     or 0
-    vol_ratio = (cur_vol / avg_vol) if avg_vol > 0 else 1.0
-    vol_pts   = min(vol_ratio / 2.0 * p["W_VOLUME"], p["W_VOLUME"])
-
-    reward_pct = ctx.get("reward_pct") or 0
-    risk_pct   = ctx.get("risk_pct")   or 0
-    rr         = (reward_pct / risk_pct) if risk_pct > 0 else 0
-    rr_pts     = min(rr / 3.0 * p["W_RR"], p["W_RR"])
-
-    reg_pts = (regime_sc * p["W_REGIME"]
-               if action == "BUY"
-               else (1 - regime_sc) * p["W_REGIME"])
-
-    total = round(strat_pts + rsi_pts + vol_pts + rr_pts + reg_pts, 1)
-    breakdown = dict(
-        strategy = round(strat_pts, 1),
-        rsi      = round(rsi_pts,   1),
-        volume   = round(vol_pts,   1),
-        rr       = round(rr_pts,    1),
-        regime   = round(reg_pts,   1),
-    )
-    return min(total, 100.0), breakdown
-
-
-def score_label(s: float) -> str:
-    if s >= 80: return "Very Strong"
-    if s >= 65: return "Strong"
-    if s >= 50: return "Good"
-    if s >= 35: return "Moderate"
-    return "Weak"
-
-# ─────────────────────────────────────────────
-#  DATA FETCH
-# ─────────────────────────────────────────────
-
-def fetch(ticker: str, days: int = 430) -> tuple:
-    try:
-        df = yf.download(
-            ticker + ".NS",
-            start=datetime.today() - timedelta(days=days),
-            end=datetime.today(),
-            progress=False,
-            auto_adjust=True,
-        )
-        if df.empty or len(df) < 80:
-            return None, "insufficient_data"
-        df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
-        return df[["Open", "High", "Low", "Close", "Volume"]].dropna(), "ok"
-    except Exception as e:
-        return None, str(e)[:120]
-
-# ─────────────────────────────────────────────
-#  PRICE CONTEXT
-# ─────────────────────────────────────────────
-
-def context(df: pd.DataFrame, p: dict) -> dict:
-    c = df.Close
-    if len(c) < 20:
-        return sanitize_for_json({
-            "price": None, "change_1d": None, "change_5d": None,
-            "rsi": None, "macd_hist": None, "ema_bullish": None,
-            "supertrend_up": None, "supertrend_line": None,
-            "support": None, "resistance": None,
-            "stop_loss": None, "target": None,
-            "risk_pct": None, "reward_pct": None,
-            "volume": 0, "avg_volume": 0,
-        })
-
-    r        = float(rsi(c, p["RSI_PERIOD"]).iloc[-1])
-    _, _, h  = macd(c, p["MACD_FAST"], p["MACD_SLOW"], p["MACD_SIGNAL"])
-    e_s      = float(ema(c, p["EMA_SHORT"]).iloc[-1])
-    e_l      = float(ema(c, p["EMA_LONG"]).iloc[-1])
-    trend, st_line = supertrend(df.High, df.Low, c, p["ATR_PERIOD"], p["SUPERTREND_MULT"])
-
-    price   = float(c.iloc[-1])
-    atr_now = float(atr(df.High, df.Low, c, p["ATR_PERIOD"]).iloc[-1])
-
-    prev_1 = float(c.iloc[-2]) if len(c) >= 2 and pd.notna(c.iloc[-2]) else None
-    prev_5 = float(c.iloc[-6]) if len(c) >= 6 and pd.notna(c.iloc[-6]) else None
-
-    sl  = round(price - 1.5 * atr_now, 2) if math.isfinite(price) and math.isfinite(atr_now) else None
-    tgt = round(price + 3.0 * atr_now, 2) if math.isfinite(price) and math.isfinite(atr_now) else None
-
-    low20  = df.Low.rolling(20).min().iloc[-1]
-    high20 = df.High.rolling(20).max().iloc[-1]
-    vol20  = df.Volume.rolling(20).mean().iloc[-1]
-
-    out = dict(
-        price    = round(price, 2) if math.isfinite(price) else None,
-        change_1d = round((price - prev_1) / prev_1 * 100, 2)
-                    if prev_1 not in (None, 0) and math.isfinite(prev_1) else None,
-        change_5d = round((price - prev_5) / prev_5 * 100, 2)
-                    if prev_5 not in (None, 0) and math.isfinite(prev_5) else None,
-        rsi         = round(r, 1) if math.isfinite(r) else None,
-        macd_hist   = round(float(h.iloc[-1]), 3)
-                      if pd.notna(h.iloc[-1]) and math.isfinite(float(h.iloc[-1])) else None,
-        ema_bullish     = bool(e_s > e_l) if math.isfinite(e_s) and math.isfinite(e_l) else None,
-        supertrend_up   = bool(trend.iloc[-1] == 1) if pd.notna(trend.iloc[-1]) else None,
-        supertrend_line = round(float(st_line.iloc[-1]), 2)
-                          if pd.notna(st_line.iloc[-1]) and math.isfinite(float(st_line.iloc[-1])) else None,
-        support    = round(float(low20),  2) if pd.notna(low20)  and math.isfinite(float(low20))  else None,
-        resistance = round(float(high20), 2) if pd.notna(high20) and math.isfinite(float(high20)) else None,
-        stop_loss  = sl,
-        target     = tgt,
-        risk_pct   = round((price - sl)  / price * 100, 2) if sl  and price else None,
-        reward_pct = round((tgt - price) / price * 100, 2) if tgt and price else None,
-        volume     = int(df.Volume.iloc[-1]) if pd.notna(df.Volume.iloc[-1]) else 0,
-        avg_volume = int(vol20) if pd.notna(vol20) and math.isfinite(float(vol20)) else 0,
-    )
-    return sanitize_for_json(out)
-
-# ─────────────────────────────────────────────
-#  MARKET REGIME  (NIFTY 50 EMA trend)
-# ─────────────────────────────────────────────
-
-def market_regime(p: dict) -> tuple[str, float]:
-    try:
-        df = yf.download("^NSEI", period="120d", progress=False, auto_adjust=True)
-        if df.empty or len(df) < 55:
-            return "UNKNOWN", 0.5
-        close = df["Close"].squeeze()
-        e50   = float(ema(close, 50).iloc[-1])
-        e20   = float(ema(close, 20).iloc[-1])
-        r     = float(rsi(close, p["RSI_PERIOD"]).iloc[-1])
-        price = float(close.iloc[-1])
-        if price > e20 > e50 and r > 50: return "BULLISH", 1.0
-        if price < e20 < e50 and r < 50: return "BEARISH", 0.0
-        return "NEUTRAL", 0.5
+        ns = float(news_score)
     except Exception:
-        return "UNKNOWN", 0.5
+        return 1.00
+
+    if ns >= 0.45:
+        mult = 1.10
+    elif ns >= 0.15:
+        mult = 1.05
+    elif ns <= -0.45:
+        mult = 0.82
+    elif ns <= -0.15:
+        mult = 0.92
+    else:
+        mult = 1.00
+
+    if news_label == "negative":
+        mult = min(mult, 0.92)
+    elif news_label == "positive":
+        mult = max(mult, 1.03)
+
+    return round(max(0.80, min(1.12, mult)), 3)
+
+def fetch_news_signal(company_name: str, ticker: str) -> dict:
+    headlines = fetch_news_headlines(company_name, ticker, max_articles=5)
+    score, label, main = hf_finbert_score(headlines)
+    alert = bool(label == "negative" and score <= -0.25)
+    return {
+        "news_score":     score,
+        "news_sentiment": label,
+        "news_headline":  main,
+        "news_alert":     alert,
+        "news_headlines": headlines,
+        "news_count":     len(headlines),
+        "news_label":     label,
+    }
+
+# ─────────────────────────────────────────────
+#  SIGNAL STREAK
+# ─────────────────────────────────────────────
+
+def load_previous_streaks() -> dict:
+    """
+    Returns {(ticker, action): streak}
+    Looks back up to 10 recent recommendation rows.
+    """
+    try:
+        res = (
+            supabase.table("recommendations")
+            .select("ticker,action,signal_streak,date")
+            .order("date", desc=True)
+            .limit(500)
+            .execute()
+        )
+        out = {}
+        for row in res.data or []:
+            key = (row.get("ticker"), row.get("action"))
+            if key not in out:
+                out[key] = int(row.get("signal_streak") or row.get("streak") or 0)
+        return out
+    except Exception as e:
+        print(f"⚠️ could not load previous streaks: {e}")
+        return {}
+
+# ─────────────────────────────────────────────
+#  MARKET REGIME
+# ─────────────────────────────────────────────
+
+def get_market_regime(p):
+    try:
+        df = yf.download("^NSEI", period="9mo", interval="1d", progress=False, auto_adjust=True)
+        if df.empty:
+            return "neutral"
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        c = df["Close"].dropna()
+        e50, e200 = ema(c, 50).iloc[-1], ema(c, 200).iloc[-1]
+        if c.iloc[-1] > e50 > e200:
+            return "bull"
+        if c.iloc[-1] < e50 < e200:
+            return "bear"
+        return "neutral"
+    except Exception:
+        return "neutral"
+
+def load_benchmark_returns(period="3y"):
+    """
+    Loads NIFTY 50 daily closes for benchmark-relative backtests.
+    """
+    try:
+        bdf = yf.download("^NSEI", period=period, interval="1d", progress=False, auto_adjust=True)
+        if bdf.empty:
+            return pd.Series(dtype=float)
+        if isinstance(bdf.columns, pd.MultiIndex):
+            bdf.columns = bdf.columns.get_level_values(0)
+        return bdf["Close"].dropna()
+    except Exception as e:
+        print(f"⚠️ benchmark load failed: {e}")
+        return pd.Series(dtype=float)
+
+# ─────────────────────────────────────────────
+#  SCORE HELPERS
+# ─────────────────────────────────────────────
+
+def calculate_support_resistance(df: pd.DataFrame, lookback: int = 20) -> tuple[float, float]:
+    """
+    Prior support/resistance. Uses only completed prior candles
+    to avoid using today's high/low in same-day decision.
+    """
+    hist = df.iloc[:-1].tail(lookback)
+    if hist.empty:
+        return None, None
+    return float(hist.Low.min()), float(hist.High.max())
+
+def calculate_adaptive_stop_target(df: pd.DataFrame, price: float, p: dict) -> tuple[float, float, float, float, float]:
+    """
+    Stop/target use prior support/resistance plus ATR. This avoids a fixed
+    mechanical 2:1 R:R for every stock.
+    """
+    support, resistance = calculate_support_resistance(df, lookback=20)
+    atr_val = float(atr(df.High, df.Low, df.Close, p["ATR_PERIOD"]).iloc[-1])
+    if not math.isfinite(atr_val) or atr_val <= 0:
+        atr_val = price * 0.02
+
+    # Stop: below support or ATR cushion, but capped to a reasonable range.
+    candidates_stop = [
+        price - 1.5 * atr_val,
+    ]
+    if support and support < price:
+        candidates_stop.append(support - 0.25 * atr_val)
+
+    stop = max(candidates_stop)
+    max_risk_price = price * 0.92
+    min_risk_price = price * 0.985
+    stop = max(stop, max_risk_price)
+    stop = min(stop, min_risk_price)
+
+    # Target: prior resistance if useful, otherwise ATR extension.
+    candidates_target = [
+        price + 2.5 * atr_val,
+    ]
+    if resistance and resistance > price:
+        candidates_target.append(resistance)
+
+    target = max(candidates_target)
+    target = max(target, price * 1.025)
+
+    risk_pct = (price - stop) / price * 100 if price > 0 else 0
+    reward_pct = (target - price) / price * 100 if price > 0 else 0
+    rr_ratio = reward_pct / risk_pct if risk_pct > 0 else 0
+
+    return (
+        round(stop, 2),
+        round(target, 2),
+        round(risk_pct, 2),
+        round(reward_pct, 2),
+        round(rr_ratio, 2),
+    )
+
+def score_components(
+    sigs: dict,
+    strategy_weights: dict,
+    action: str,
+    df: pd.DataFrame,
+    p: dict,
+    regime: str,
+    risk_pct: float,
+    reward_pct: float,
+    rr_ratio: float,
+):
+    close = float(df.Close.iloc[-1])
+    r_val = float(rsi(df.Close, p["RSI_PERIOD"]).iloc[-1])
+    vol   = float(df.Volume.iloc[-1])
+    avgv  = float(df.Volume.rolling(20).mean().iloc[-1])
+    active = [name for name, val in sigs.items() if val != 0]
+    dir_val = 1 if action == "BUY" else -1
+
+    signed_w = sum(strategy_weights.get(k, 0) * dir_val for k, v in sigs.items() if v == dir_val)
+    all_w    = sum(abs(strategy_weights.get(k, 0)) for k in sigs.keys()) or 1
+    strategy_score = max(0, min(100, (signed_w / all_w) * 100))
+
+    if action == "BUY":
+        if r_val < 30:
+            rsi_score = 100
+        elif r_val < 40:
+            rsi_score = 80
+        elif r_val < 55:
+            rsi_score = 65
+        elif r_val < 70:
+            rsi_score = 45
+        else:
+            rsi_score = 20
+    else:
+        if r_val > 70:
+            rsi_score = 100
+        elif r_val > 60:
+            rsi_score = 80
+                elif r_val > 45:
+            rsi_score = 55
+        else:
+            rsi_score = 30
+
+    if avgv > 0:
+        vol_ratio = vol / avgv
+    else:
+        vol_ratio = 1
+    volume_score = max(0, min(100, vol_ratio * 50))
+
+    # Dynamic R:R score. Avoid giving full credit to a fixed 2:1 setup.
+    if rr_ratio >= 3:
+        rr_score = 100
+    elif rr_ratio >= 2:
+        rr_score = 80
+    elif rr_ratio >= 1.5:
+        rr_score = 65
+    elif rr_ratio >= 1:
+        rr_score = 45
+    else:
+        rr_score = 20
+
+    if action == "BUY":
+        regime_score = 100 if regime == "bull" else 50 if regime == "neutral" else 20
+    else:
+        regime_score = 100 if regime == "bear" else 50 if regime == "neutral" else 20
+
+    raw = (
+        strategy_score * p["W_STRATEGY"] / 100
+        + rsi_score * p["W_RSI"] / 100
+        + volume_score * p["W_VOLUME"] / 100
+        + rr_score * p["W_RR"] / 100
+        + regime_score * p["W_REGIME"] / 100
+    )
+
+    return {
+        "strategy_score": round(strategy_score, 1),
+        "rsi_score":      round(rsi_score, 1),
+        "volume_score":   round(volume_score, 1),
+        "rr_score":       round(rr_score, 1),
+        "regime_score":   round(regime_score, 1),
+        "raw_score":      round(raw, 1),
+        "rsi":            round(r_val, 2),
+        "volume_ratio":   round(vol_ratio, 2),
+        "active":         active,
+    }
+
+def label_score(score):
+    if score >= 75: return "Strong"
+    if score >= 60: return "Medium"
+    if score >= 45: return "Weak"
+    return "Low"
 
 # ─────────────────────────────────────────────
 #  MAIN
 # ─────────────────────────────────────────────
 
-def run():
-    today = datetime.today().strftime("%Y-%m-%d")
-    print(f"\n🇮🇳 Indian Stock Agent v5 — {today}")
+def main():
+    print("🚀 Starting Indian Stock Agent v5")
+    today = datetime.now().date().isoformat()
 
-    # ── Credentials
-    P, param_version = load_active_params()
-    hf_token  = os.environ.get("HF_TOKEN", "")
-    tg_token  = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-    tg_chat   = os.environ.get("TELEGRAM_CHAT_ID", "")
+    params, param_version = load_active_params()
+    print(f"⚙️  Active params: {param_version}")
+    print("   " + json.dumps(params, indent=2)[:500].replace("\n", " "))
 
-    if not hf_token:
-        print("  ℹ️  HF_TOKEN not set — news sentiment will be skipped")
-    if not tg_token:
-        print("  ℹ️  TELEGRAM_BOT_TOKEN not set — Telegram alerts disabled")
-    if not _GNEWS_OK:
-        print("  ℹ️  gnews not installed — news features disabled")
+    regime = get_market_regime(params)
+    print(f"📈 Market regime: {regime}")
 
-    print(f"   Params : {param_version}")
-    print(f"   Stocks : {len(ALL_TICKERS)} NSE tickers\n")
+    benchmark_close = load_benchmark_returns(period="3y")
+    prev_streaks    = load_previous_streaks()
 
-    STRATEGIES = get_strategies(P)
+    all_recs, run_log = [], []
+    buys = sells = neutral = 0
 
-    print("   Checking NIFTY market regime...")
-    regime_label, regime_sc = market_regime(P)
-    print(f"   Regime : {regime_label}  (score={regime_sc})")
+    # Strategy functions
+    strategies = get_strategies(params)
 
-    # ── Pre-fetch signal streaks in one query
-    print("   Loading signal streak history...")
-    streaks = get_signal_streaks(today)
-    print(f"   {len(streaks)} tickers have recent signal history\n")
-
-    # ── Wipe today's stale rows (idempotent re-runs)
-    supabase.table("recommendations").delete().eq("date", today).execute()
-    supabase.table("ticker_run_log").delete().eq("date", today).execute()
-
-    records, run_logs = [], []
-    gate_counts = {"fetched": 0, "any_signal": 0, "passed_weight": 0}
-
-    for i, ticker in enumerate(ALL_TICKERS, 1):
-        sys.stdout.write(f"\r  {i}/{len(ALL_TICKERS)}  {ticker:<15}")
-        sys.stdout.flush()
-
-        df, status = fetch(ticker)
-        run_logs.append(sanitize_for_json({"date": today, "ticker": ticker, "status": status}))
-        if df is None:
-            continue
-        gate_counts["fetched"] += 1
-
+    for ticker in ALL_TICKERS:
+        print(f"\n📊 {ticker}")
         try:
-            today_sigs = {name: int(fn(df).iloc[-1]) for name, fn in STRATEGIES.items()}
-            buy_count  = sum(1 for v in today_sigs.values() if v ==  1)
-            sell_count = sum(1 for v in today_sigs.values() if v == -1)
-
-            if buy_count == 0 and sell_count == 0:
+            df = yf.download(
+                ticker + ".NS",
+                period="3y",
+                interval="1d",
+                progress=False,
+                auto_adjust=True,
+            )
+            if df.empty or len(df) < 252:
+                print("  ⚠️ insufficient data")
+                run_log.append({"date": today, "ticker": ticker, "status": "insufficient"})
+                neutral += 1
                 continue
-            gate_counts["any_signal"] += 1
 
-            bt     = {name: backtest(df, fn(df), P) for name, fn in STRATEGIES.items()}
-            action = "BUY" if buy_count >= sell_count else "SELL"
-            w_ratio, weights = weighted_vote(today_sigs, bt, action)
-
-            if w_ratio < P["MIN_WEIGHTED_SCORE"]:
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            df = df.dropna()
+            if df.empty:
+                print("  ⚠️ empty after dropna")
+                run_log.append({"date": today, "ticker": ticker, "status": "empty"})
+                neutral += 1
                 continue
-            gate_counts["passed_weight"] += 1
 
-            # ── Context & composite score (computed before fund/news for the threshold check)
-            ctx     = context(df, P)
-            c_score, c_breakdown = composite_score(today_sigs, bt, ctx, regime_sc, action, P)
+            # Last technical values
+            close = float(df.Close.iloc[-1])
+            change_1d = float((df.Close.iloc[-1] / df.Close.iloc[-2] - 1) * 100) if len(df) > 2 else 0
+            change_5d = float((df.Close.iloc[-1] / df.Close.iloc[-6] - 1) * 100) if len(df) > 6 else 0
 
-            # ── Fundamentals (all passing stocks)
-            fund = fetch_fundamentals(ticker)
-            company_name = fund.get("company_name") or NSE_COMPANY_NAMES.get(ticker, ticker)
+            r_series = rsi(df.Close, params["RSI_PERIOD"])
+            r_val = float(r_series.iloc[-1]) if not pd.isna(r_series.iloc[-1]) else None
+            _, _, macd_hist = macd(df.Close, params["MACD_FAST"], params["MACD_SLOW"], params["MACD_SIGNAL"])
+            mh_val = float(macd_hist.iloc[-1]) if not pd.isna(macd_hist.iloc[-1]) else None
+            ema_bullish = bool(ema(df.Close, params["EMA_SHORT"]).iloc[-1] > ema(df.Close, params["EMA_LONG"]).iloc[-1])
+            st_trend, st_line = supertrend(df.High, df.Low, df.Close, params["ATR_PERIOD"], params["SUPERTREND_MULT"])
+            supertrend_up = bool(st_trend.iloc[-1] == 1)
+            supertrend_line = float(st_line.iloc[-1]) if not pd.isna(st_line.iloc[-1]) else None
 
-            # ── News sentiment (only if score is interesting enough and HF token present)
-            if c_score >= 25 and hf_token:
-                news = fetch_news_sentiment(ticker, company_name, hf_token)
-                # news_alert: technical signal contradicts news sentiment
-                news["news_alert"] = (
-                    (action == "BUY"  and news.get("news_sentiment") == "NEGATIVE") or
-                    (action == "SELL" and news.get("news_sentiment") == "POSITIVE")
+            support, resistance = calculate_support_resistance(df, lookback=20)
+            stop_loss, target, risk_pct, reward_pct, rr_ratio = calculate_adaptive_stop_target(df, close, params)
+
+            # Per strategy signals and historical performance
+            sigs = {}
+            bts  = {}
+            weights = {}
+            for name, fn in strategies.items():
+                sig_series = fn(df)
+                latest_sig = int(sig_series.iloc[-1])
+                sigs[name] = latest_sig
+
+                bt = backtest(df, sig_series, params, benchmark_close=benchmark_close)
+                bts[name] = bt
+
+                # Weight: profit factor and sample size. Penalize very tiny samples.
+                sample_mult = min(1.0, bt["trades"] / 10) if bt["trades"] else 0
+                pf_score = min(bt["profit_factor"], 3) / 3
+                wr_score = bt["win_rate"] / 100
+                rel_score = 0.55 if bt.get("avg_relative_return", 0) > 0 else 0.45
+                weights[name] = round((0.45 * wr_score + 0.35 * pf_score + 0.20 * rel_score) * sample_mult, 3)
+
+            buy_w  = sum(weights[k] for k, v in sigs.items() if v == 1)
+            sell_w = sum(weights[k] for k, v in sigs.items() if v == -1)
+
+            if buy_w > sell_w and buy_w >= params["MIN_WEIGHTED_SCORE"]:
+                action = "BUY"
+                buys += 1
+            elif sell_w > buy_w and sell_w >= params["MIN_WEIGHTED_SCORE"]:
+                # SELL is not modelled as short-selling. It means exit/avoid long.
+                action = "EXIT"
+                sells += 1
+            else:
+                print("  → no weighted signal")
+                run_log.append({"date": today, "ticker": ticker, "status": "no_signal"})
+                neutral += 1
+                continue
+
+            signal_type = "LONG_ENTRY" if action == "BUY" else "EXIT_LONG_OR_AVOID"
+            print(f"  ✅ {action} | buy_w={buy_w:.2f} sell_w={sell_w:.2f}")
+
+            # Score components
+            components = score_components(
+                sigs=sigs,
+                strategy_weights=weights,
+                action="BUY" if action == "BUY" else "SELL",
+                df=df,
+                p=params,
+                regime=regime,
+                risk_pct=risk_pct,
+                reward_pct=reward_pct,
+                rr_ratio=rr_ratio,
+            )
+            technical_score = components["raw_score"]
+
+            # Low sample warning
+            active_names = components["active"]
+            active_bts = [bts[n] for n in active_names] if active_names else []
+            avg_trades = int(np.mean([bt["trades"] for bt in active_bts])) if active_bts else 0
+            low_sample_warning = bool(avg_trades < 5)
+
+            # Aggregate backtest stats for active strategies
+            if active_bts:
+                win_rate   = round(float(np.mean([bt["win_rate"] for bt in active_bts])), 1)
+                avg_return = round(float(np.mean([bt["avg_return"] for bt in active_bts])), 2)
+                med_return = round(float(np.mean([bt["median_return"] for bt in active_bts])), 2)
+                pf         = round(float(np.mean([bt["profit_factor"] for bt in active_bts])), 2)
+                max_dd     = round(float(np.mean([bt["max_drawdown"] for bt in active_bts])), 2)
+                benchmark_avg_return = round(float(np.mean([bt.get("benchmark_avg_return", 0) for bt in active_bts])), 2)
+                relative_avg_return  = round(float(np.mean([bt.get("avg_relative_return", 0) for bt in active_bts])), 2)
+                benchmark_outperformance_rate = round(
+                    float(np.mean([bt.get("benchmark_outperformance_rate", 0) for bt in active_bts])),
+                    1,
                 )
+            else:
+                win_rate = avg_return = med_return = pf = max_dd = 0
+                benchmark_avg_return = relative_avg_return = benchmark_outperformance_rate = 0
+
+            # Fundamentals for all weighted signals
+            fund = fetch_fundamentals(ticker)
+
+            # News only for decent raw technical signals to limit API calls
+            if technical_score >= 25:
+                news = fetch_news_signal(fund["company_name"], ticker)
             else:
                 news = {
                     "news_score": 0.0,
-                    "news_sentiment": "NEUTRAL",
-                    "news_headline": None,
+                    "news_sentiment": "neutral",
+                    "news_headline": "",
+                    "news_alert": False,
                     "news_headlines": [],
                     "news_count": 0,
-                    "news_multiplier": 1.0,
-                    "news_alert": False,
+                    "news_label": "neutral",
                 }
 
-            # ── Signal streak (previous days + today = total)
-            prev_streak  = streaks.get(ticker, 0)
-            streak_today = prev_streak + 1
+            f_mult = fundamental_multiplier(fund.get("fundamental_score"), fund.get("fundamental_flag"))
+            n_mult = news_multiplier(news.get("news_score"), news.get("news_sentiment"))
 
-            # ── Aggregate backtest for active strategies
-            active  = [
-                n for n, v in today_sigs.items()
-                if (v == 1 and action == "BUY") or (v == -1 and action == "SELL")
-            ]
-            agg     = lambda k: round(float(np.mean([bt[n][k] for n in active])), 2) if active else 0
-            low_smp = (int(np.mean([bt[n]["trades"] for n in active])) < 5) if active else True
+            final_multiplier = round(f_mult * n_mult, 3)
+            composite_score = round(max(0, min(100, technical_score * final_multiplier)), 1)
 
-            record = dict(
-                # Core
-                date              = today,
-                ticker            = ticker,
-                action            = action,
-                score             = int(round(float(c_score))) if c_score is not None else 0,
-                raw_score         = int(buy_count if action == "BUY" else sell_count),
-                weighted_score_val= float(w_ratio),
-                composite_score   = float(c_score) if c_score is not None else 0.0,
-                score_label       = score_label(c_score if c_score is not None else 0),
-                score_breakdown   = json.dumps(sanitize_for_json(c_breakdown)),
-                # Strategies
-                signals           = json.dumps(sanitize_for_json(today_sigs)),
-                strategy_weights  = json.dumps(sanitize_for_json(weights)),
-                backtest          = json.dumps(sanitize_for_json(bt)),
-                active_strategies = ", ".join(active),
-                low_sample_warning= bool(low_smp),
-                # Backtest aggregates
-                win_rate          = float(agg("win_rate")),
-                avg_return        = float(agg("avg_return")),
-                median_return     = float(agg("median_return")),
-                profit_factor     = float(agg("profit_factor")),
-                max_drawdown      = float(agg("max_drawdown")),
-                avg_trades        = int(round(np.mean([bt[n]["trades"] for n in active]))) if active else 0,
-                # Context
-                market_regime     = regime_label,
-                param_version     = param_version,
-                # Fundamentals
-                company_name      = fund.get("company_name"),
-                pe_ratio          = fund.get("pe_ratio"),
-                debt_equity       = fund.get("debt_equity"),
-                revenue_growth    = fund.get("revenue_growth"),
-                fundamental_flag  = fund.get("fundamental_flag"),
-                # Additional fundamental fields from yfinance
-                de_ratio          = fund.get("debt_equity"),
-                sector            = fund.get("sector"),
-                market_cap_cr     = fund.get("market_cap_cr"),
-                roe               = fund.get("roe"),
-                fundamental_score = fund.get("fundamental_score", 50),
-                fundamental_warnings = json.dumps([] if fund.get("fundamental_flag") in (None, "", "OK", "DATA_UNAVAILABLE") else [x.strip() for x in str(fund.get("fundamental_flag", "")).split(',') if x.strip()]),
-                # News
-                news_score        = news.get("news_score"),
-                news_sentiment    = news.get("news_sentiment"),
-                news_headline     = news.get("news_headline"),
-                news_alert        = bool(news.get("news_alert", False)),
-                # Dashboard/schema aliases for compatibility
-                news_label        = (news.get("news_sentiment") or "NEUTRAL").lower(),
-                news_headlines    = json.dumps(sanitize_for_json(news.get("news_headlines") or ([news.get("news_headline")] if news.get("news_headline") else []))),
-                news_multiplier   = float(news.get("news_multiplier", 1.0)),
-                news_count        = int(news.get("news_count", 1 if news.get("news_headline") else 0)),
-                # Streak
-                signal_streak     = streak_today,
-                streak            = streak_today,
-                **ctx,
-            )
+            score_label = label_score(composite_score)
 
-            safe_record = sanitize_for_json(record)
-            json.dumps(safe_record)   # validate serializability
-            records.append(safe_record)
+            # Streak
+            prev_streak = prev_streaks.get((ticker, action), 0)
+            signal_streak = prev_streak + 1
+
+            rec = {
+                "date": today,
+                "ticker": ticker,
+                "action": action,
+                "signal_type": signal_type,
+
+                "score": int(round(composite_score)),
+                "raw_score": int(round(technical_score)),
+                "weighted_score_val": float(buy_w if action == "BUY" else sell_w),
+                "technical_score": technical_score,
+                "composite_score": composite_score,
+                "final_score_multiplier": final_multiplier,
+                "score_label": score_label,
+
+                "signals": sanitize_for_json(sigs),
+                "strategy_weights": sanitize_for_json(weights),
+                "backtest": sanitize_for_json(bts),
+                "score_breakdown": sanitize_for_json({
+                    **components,
+                    "technical_score": technical_score,
+                    "fundamental_multiplier": f_mult,
+                    "news_multiplier": n_mult,
+                    "final_multiplier": final_multiplier,
+                    "benchmark_avg_return": benchmark_avg_return,
+                    "relative_avg_return": relative_avg_return,
+                    "benchmark_outperformance_rate": benchmark_outperformance_rate,
+                }),
+                              "benchmark_symbol": "^NSEI",
+                    "benchmark_return_pct": benchmark_avg_return,
+                    "relative_return_pct": relative_avg_return,
+                    "benchmark_outperformance_rate": benchmark_outperformance_rate,
+                }),
+
+                "active_strategies": ", ".join(active_names),
+                "low_sample_warning": low_sample_warning,
+
+                "win_rate": win_rate,
+                "avg_return": avg_return,
+                "median_return": med_return,
+                "profit_factor": pf,
+                "max_drawdown": max_dd,
+                "avg_trades": avg_trades,
+
+                "benchmark_symbol": "^NSEI",
+                "benchmark_return_pct": benchmark_avg_return,
+                "relative_return_pct": relative_avg_return,
+                "benchmark_outperformance_rate": benchmark_outperformance_rate,
+
+                "market_regime": regime,
+                "param_version": param_version,
+
+                "price": round(close, 2),
+                "change_1d": round(change_1d, 2),
+                "change_5d": round(change_5d, 2),
+                "rsi": round(r_val, 2) if r_val is not None else None,
+                "macd_hist": round(mh_val, 4) if mh_val is not None else None,
+                "ema_bullish": ema_bullish,
+                "supertrend_up": supertrend_up,
+                "supertrend_line": round(supertrend_line, 2) if supertrend_line is not None else None,
+
+                "support": round(support, 2) if support is not None else None,
+                "resistance": round(resistance, 2) if resistance is not None else None,
+                "stop_loss": stop_loss,
+                "target": target,
+                "risk_pct": risk_pct,
+                "reward_pct": reward_pct,
+                "rr_ratio": rr_ratio,
+
+                "volume": int(df.Volume.iloc[-1]),
+                "avg_volume": int(df.Volume.rolling(20).mean().iloc[-1]),
+
+                "company_name": fund.get("company_name"),
+                "pe_ratio": fund.get("pe_ratio"),
+                "revenue_growth": fund.get("revenue_growth"),
+                "debt_equity": fund.get("debt_equity"),
+                "de_ratio": fund.get("debt_equity"),
+                "fundamental_score": fund.get("fundamental_score"),
+                "fundamental_flag": fund.get("fundamental_flag"),
+                "fundamental_warnings": sanitize_for_json(
+                    [] if fund.get("fundamental_flag") in ("OK", "DATA_UNAVAILABLE", None)
+                    else str(fund.get("fundamental_flag")).split(",")
+                ),
+                "market_cap_cr": fund.get("market_cap_cr"),
+                "roe": fund.get("roe"),
+                "sector": fund.get("sector"),
+
+                "news_score": news.get("news_score"),
+                "news_sentiment": news.get("news_sentiment"),
+                "news_headline": news.get("news_headline"),
+                "news_alert": news.get("news_alert"),
+                "news_label": news.get("news_label") or news.get("news_sentiment"),
+                "news_count": news.get("news_count"),
+                "news_headlines": sanitize_for_json(news.get("news_headlines", [])),
+                "news_multiplier": n_mult,
+
+                "signal_streak": signal_streak,
+                "streak": signal_streak,
+            }
+
+            all_recs.append(sanitize_for_json(rec))
+            run_log.append({"date": today, "ticker": ticker, "status": action})
+
+            # Small pause to reduce yfinance/news throttling risk
+            time.sleep(0.15)
 
         except Exception as e:
-            print(f"\n  ⚠️  Skipping {ticker}: {e}")
+            print(f"  ❌ failed: {e}")
+            run_log.append({"date": today, "ticker": ticker, "status": "error"})
+            neutral += 1
+            continue
 
-        time.sleep(0.1)
+    # ─────────────────────────────────────────
+    # Save recommendations
+    # ─────────────────────────────────────────
+    print(f"\n💾 Saving {len(all_recs)} recommendations...")
 
-    sys.stdout.write("\r" + " " * 60 + "\r")
-
-    # ── Pipeline summary
-    failed_count = sum(1 for l in run_logs if l["status"] != "ok")
-    print(f"  Pipeline summary:")
-    print(f"    Tickers scanned  : {len(ALL_TICKERS)}")
-    print(f"    Data fetched OK  : {gate_counts['fetched']}")
-    print(f"    Any signal fired : {gate_counts['any_signal']}")
-    print(f"    Passed weight    : {gate_counts['passed_weight']}  (threshold={P['MIN_WEIGHTED_SCORE']})")
-    print(f"    Final signals    : {len(records)}")
-    print(f"    Failed fetches   : {failed_count}\n")
-
-    # ── Market breadth
-    breadth = compute_market_breadth(records)
-    print(f"  Market Breadth : {breadth['breadth_label']} "
-          f"({breadth['buy_count']} buy / {breadth['sell_count']} sell)\n")
-
-    # ── Save recommendations
-    if records:
-        print(f"  Saving {len(records)} recommendations to Supabase...")
-        saved = 0
-        for i in range(0, len(records), 20):
-            batch = records[i:i + 20]
-            try:
+    if all_recs:
+        try:
+            batch_size = 100
+            for i in range(0, len(all_recs), batch_size):
+                batch = all_recs[i:i + batch_size]
                 supabase.table("recommendations").insert(batch).execute()
-                saved += len(batch)
-            except Exception as e:
-                print(f"  INSERT ERROR batch {i // 20 + 1}: {e}")
-                print(f"  First record keys: {list(batch[0].keys())}")
-        print(f"  Saved {saved}/{len(records)} recommendations")
+            print("✅ Recommendations saved")
+        except Exception as e:
+            print(f"❌ Recommendation insert failed: {e}")
+
+    # ─────────────────────────────────────────
+    # Save run log
+    # ─────────────────────────────────────────
+    if run_log:
+        try:
+            batch_size = 200
+            for i in range(0, len(run_log), batch_size):
+                batch = run_log[i:i + batch_size]
+                supabase.table("ticker_run_log").insert(batch).execute()
+            print("✅ Run log saved")
+        except Exception as e:
+            print(f"⚠️ Run log insert failed: {e}")
+
+    # ─────────────────────────────────────────
+    # Market breadth + meta update
+    # ─────────────────────────────────────────
+    signal_total = len(all_recs)
+    breadth_buys = sum(1 for r in all_recs if r.get("action") == "BUY")
+    breadth_sells = sum(1 for r in all_recs if r.get("action") in ("EXIT", "SELL"))
+    breadth_total = breadth_buys + breadth_sells
+
+    if breadth_total > 0:
+        breadth_ratio = breadth_buys / breadth_total
     else:
-        print(f"  No signals met threshold (MIN_WEIGHTED_SCORE={P['MIN_WEIGHTED_SCORE']})")
-        print(f"  Scanned {len(ALL_TICKERS)} tickers, 0 passed filter")
+        breadth_ratio = 0.5
 
-    # ── Save run log
+    if breadth_ratio >= 0.70:
+        breadth_label = "VERY_BULLISH"
+    elif breadth_ratio >= 0.55:
+        breadth_label = "BULLISH"
+    elif breadth_ratio >= 0.45:
+        breadth_label = "NEUTRAL"
+    elif breadth_ratio >= 0.30:
+        breadth_label = "BEARISH"
+    else:
+        breadth_label = "VERY_BEARISH"
+
+    meta = {
+        "id": 1,
+        "last_run": today,
+        "total_signals": signal_total,
+        "tickers_scanned": len(ALL_TICKERS),
+        "failed": sum(1 for r in run_log if r.get("status") == "error"),
+        "market_regime": regime,
+        "active_param_version": param_version,
+        "total_buys": breadth_buys,
+        "total_sells": breadth_sells,
+        "breadth_ratio": round(breadth_ratio, 3),
+        "breadth_label": breadth_label,
+        "breadth_buys": breadth_buys,
+        "breadth_sells": breadth_sells,
+        "breadth_neutral": neutral,
+        "updated_at": datetime.now().isoformat(),
+    }
+
     try:
-        for i in range(0, len(run_logs), 50):
-            supabase.table("ticker_run_log").insert(run_logs[i:i + 50]).execute()
+        supabase.table("agent_meta").upsert(meta).execute()
+        print("✅ Agent meta updated")
     except Exception as e:
-        print(f"  ⚠️  Run log insert failed: {e}")
+        print(f"⚠️ Agent meta update failed: {e}")
 
-    # ── Update agent_meta (includes breadth)
-    try:
-        supabase.table("agent_meta").upsert(sanitize_for_json({
-            "id":                    1,
-            "last_run":              today,
-            "total_signals":         len(records),
-            "tickers_scanned":       len(ALL_TICKERS),
-            "failed":                failed_count,
-            "market_regime":         regime_label,
-            "active_param_version":  param_version,
-            "total_buys":            breadth["buy_count"],
-            "total_sells":           breadth["sell_count"],
-            "breadth_ratio":         breadth["breadth_ratio"],
-            "breadth_label":         breadth["breadth_label"],
-            "breadth_buys":          breadth["buy_count"],
-            "breadth_sells":         breadth["sell_count"],
-            "breadth_neutral":       max(0, len(ALL_TICKERS) - breadth["buy_count"] - breadth["sell_count"]),
-        })).execute()
-    except Exception as e:
-        print(f"  ⚠️  Meta upsert failed: {e}")
+    # ─────────────────────────────────────────
+    # Optional Telegram alert
+    # ─────────────────────────────────────────
+    bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-    # ── Telegram morning alert
-    if tg_token and tg_chat and records:
-        msg = _build_telegram_message(records, regime_label, breadth, today)
-        send_telegram_alert(tg_token, tg_chat, msg)
-    elif tg_token and not records:
-        send_telegram_alert(
-            tg_token, tg_chat,
-            f"🇮🇳 <b>Indian Stock Agent — {today}</b>\n"
-            f"No signals today. Market: {regime_label}.",
-        )
+    if bot_token and chat_id and all_recs:
+        try:
+            top_buys = sorted(
+                [r for r in all_recs if r.get("action") == "BUY"],
+                key=lambda x: x.get("composite_score", 0),
+                reverse=True,
+            )[:5]
 
-    print("  Done ✅\n")
+            top_exits = sorted(
+                [r for r in all_recs if r.get("action") in ("EXIT", "SELL")],
+                key=lambda x: x.get("composite_score", 0),
+                reverse=True,
+            )[:3]
+
+            lines = [
+                f"🇮🇳 <b>Stock Agent — {today}</b>",
+                f"Market regime: <b>{regime}</b>",
+                f"Breadth: <b>{breadth_label}</b> "
+                f"({breadth_buys} BUY / {breadth_sells} EXIT)",
+                "",
+            ]
+
+            if top_buys:
+                lines.append("🟢 <b>Top BUY signals</b>")
+                for idx, r in enumerate(top_buys, 1):
+                    lines.append(
+                        f"{idx}. <b>{r['ticker']}</b> — "
+                        f"{r.get('composite_score', 0):.0f}/100 "
+                        f"₹{r.get('price', 0):,.2f}"
+                    )
+                    lines.append(
+                        f"   SL ₹{r.get('stop_loss', 0):,.2f} | "
+                        f"Target ₹{r.get('target', 0):,.2f} | "
+                        f"R:R {r.get('rr_ratio', 0):.2f}"
+                    )
+                    if r.get("active_strategies"):
+                        lines.append(f"   {r.get('active_strategies')}")
+                    if r.get("news_headline"):
+                        headline = str(r.get("news_headline"))[:90]
+                        lines.append(f"   📰 {headline}")
+
+            if top_exits:
+                lines.append("")
+                lines.append("🔴 <b>Top EXIT / avoid-long signals</b>")
+                for idx, r in enumerate(top_exits, 1):
+                    lines.append(
+                        f"{idx}. <b>{r['ticker']}</b> — "
+                        f"{r.get('composite_score', 0):.0f}/100 "
+                        f"₹{r.get('price', 0):,.2f}"
+                    )
+                    if r.get("active_strategies"):
+                        lines.append(f"   {r.get('active_strategies')}")
+
+            lines.append("")
+            lines.append("Paper-trading signal only. Not financial advice.")
+
+            msg = "\n".join(lines)
+
+            resp = requests.post(
+                f"https://api.telegram.org/bot{bot_token}/sendMessage",
+                json={
+                    "chat_id": chat_id,
+                    "text": msg,
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": True,
+                },
+                timeout=20,
+            )
+
+            if resp.status_code == 200:
+                print("✅ Telegram alert sent")
+            else:
+                print(f"⚠️ Telegram failed: {resp.status_code} {resp.text[:200]}")
+
+        except Exception as e:
+            print(f"⚠️ Telegram alert failed: {e}")
+
+    print("\n✅ Daily analysis complete")
+    print(f"Signals: {signal_total} | BUY: {breadth_buys} | EXIT: {breadth_sells} | Neutral: {neutral}")
 
 
 if __name__ == "__main__":
-    run()
+    main()
