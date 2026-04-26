@@ -171,33 +171,90 @@ def sig_rsi_trend_shift(df, p):
 SLIPPAGE_PCT  = 0.10   # 0.1% slippage per trade (entry + exit combined)
 BROKERAGE_PCT = 0.05   # Zerodha-style flat brokerage approximation
 
+def _finite_float(v, default=None):
+    try:
+        fv = float(v)
+        return fv if np.isfinite(fv) else default
+    except Exception:
+        return default
+
+
+def _dynamic_levels(df, signal_idx, entry_price, p):
+    lookback = int(p.get("RR_LOOKBACK", 20))
+    atr_period = int(p.get("ATR_PERIOD", 14))
+    support_s = df.Low.rolling(lookback).min().shift(1)
+    resist_s = df.High.rolling(lookback).max().shift(1)
+    atr_s = atr(df.High, df.Low, df.Close, atr_period)
+    support = _finite_float(support_s.iloc[signal_idx] if signal_idx < len(support_s) else None)
+    resistance = _finite_float(resist_s.iloc[signal_idx] if signal_idx < len(resist_s) else None)
+    atr_now = _finite_float(atr_s.iloc[signal_idx] if signal_idx < len(atr_s) else None)
+    if atr_now is None or atr_now <= 0:
+        return entry_price * (1 - p["BT_SL_PCT"] / 100), entry_price * (1 + p["BT_TARGET_PCT"] / 100)
+    stop_buf = float(p.get("ATR_STOP_BUFFER", 0.50))
+    target_buf = float(p.get("ATR_TARGET_BUFFER", 0.50))
+    max_risk_atr = float(p.get("MAX_RISK_ATR", 3.00))
+    sl = (support - stop_buf * atr_now) if support is not None and support < entry_price else entry_price - 1.25 * atr_now
+    sl = max(sl, entry_price - max_risk_atr * atr_now)
+    if sl >= entry_price:
+        sl = entry_price - 1.25 * atr_now
+    tgt = (resistance + target_buf * atr_now) if resistance is not None and resistance > entry_price else entry_price + 1.75 * atr_now
+    if tgt <= entry_price:
+        tgt = entry_price + 1.75 * atr_now
+    return sl, tgt
+
+
 def backtest_with_costs(df, signals, p):
     """
-    Backtest with:
-    - Stop-loss, target, or max-hold exit
+    Long-only next-bar backtest with:
+    - BUY signal on bar i enters at bar i+1 open
+    - EXIT signal on bar i closes an open long at bar i+1 open
+    - Dynamic stop/target from prior support/resistance plus ATR
     - Slippage + brokerage deducted from each trade
     """
     trades, reasons = [], []
     in_t, ep, entry_idx = False, 0.0, -1
+    sl_px = tgt_px = None
     closes=df.Close.values; highs=df.High.values
     lows=df.Low.values; opens=df.Open.values
-    sl_pct=p["BT_SL_PCT"]; tgt_pct=p["BT_TARGET_PCT"]; max_hold=p["BT_MAX_HOLD"]
+    max_hold=p["BT_MAX_HOLD"]
     cost_pct = SLIPPAGE_PCT + BROKERAGE_PCT   # deducted from each trade's gross return
 
-    for i in range(1, len(df)):
-        # Next-bar execution: a signal on day i-1 is entered at day i open.
-        if (not in_t) and signals.iloc[i-1] == 1 and opens[i] > 0:
-            ep, entry_idx, in_t = opens[i], i, True
+    def close_trade(exit_px, reason):
+        nonlocal in_t, ep, entry_idx, sl_px, tgt_px
+        gross = (exit_px - ep) / ep * 100 if ep else 0.0
+        trades.append(gross - cost_pct)
+        reasons.append(reason)
+        in_t = False
+        ep, entry_idx = 0.0, -1
+        sl_px = tgt_px = None
 
+    for i in range(1, len(df)):
+        prev_sig = int(signals.iloc[i - 1]) if pd.notna(signals.iloc[i - 1]) else 0
         if in_t:
-            sl_px=ep*(1-sl_pct/100); tgt_px=ep*(1+tgt_pct/100)
-            gross = None
-            if   lows[i]  <= sl_px:          gross=(sl_px-ep)/ep*100;   reasons.append("sl")
-            elif highs[i] >= tgt_px:         gross=(tgt_px-ep)/ep*100;  reasons.append("target")
-            elif i >= entry_idx + max_hold:  gross=(closes[i]-ep)/ep*100; reasons.append("timeout")
-            if gross is not None:
-                trades.append(gross - cost_pct)
-                in_t = False
+            if prev_sig == -1:
+                close_trade(float(opens[i]), "exit_signal")
+                continue
+            if sl_px is not None and lows[i] <= sl_px:
+                close_trade(float(sl_px), "sl")
+                continue
+            if tgt_px is not None and highs[i] >= tgt_px:
+                close_trade(float(tgt_px), "target")
+                continue
+            if i >= entry_idx + max_hold:
+                close_trade(float(closes[i]), "timeout")
+                continue
+        if not in_t and prev_sig == 1:
+            ep = float(opens[i])
+            if ep <= 0:
+                continue
+            sl_px, tgt_px = _dynamic_levels(df, i - 1, ep, p)
+            entry_idx, in_t = i, True
+            if sl_px is not None and lows[i] <= sl_px:
+                close_trade(float(sl_px), "sl")
+                continue
+            if tgt_px is not None and highs[i] >= tgt_px:
+                close_trade(float(tgt_px), "target")
+                continue
 
     if not trades:
         return dict(win_rate=0, avg_return=0, median_return=0, trades=0,
@@ -211,7 +268,7 @@ def backtest_with_costs(df, signals, p):
     wr=len(wins)/len(trades)
     avg_win =float(np.mean(wins)) if wins else 0
     avg_loss=float(np.mean([abs(l) for l in losses])) if losses else 0
-    expectancy = wr*avg_win - (1-wr)*avg_loss   # per-trade expected return
+    expectancy = wr*avg_win - (1-wr)*avg_loss
 
     return dict(
         win_rate=round(wr*100,1),
@@ -398,187 +455,177 @@ def fetch_all_data() -> dict:
 #  SUPABASE HELPERS
 # ─────────────────────────────────────────────
 
-def get_next_version() -> int:
+def next_version() -> int:
+    """Get next version number for agent_params."""
     try:
-        res = (
-            supabase.table("agent_params")
-            .select("version")
-            .order("version", desc=True)
-            .limit(1)
-            .execute()
-        )
+        res = supabase.table("agent_params").select("version").order("version",desc=True).limit(1).execute()
         if res.data:
             return int(res.data[0]["version"]) + 1
     except Exception:
         pass
     return 1
 
-def demote_old_challengers():
+def get_champion() -> dict | None:
     try:
-        supabase.table("agent_params").update({"status": "candidate"}).eq("status", "challenger").execute()
-    except Exception as e:
-        print(f"⚠️  Could not demote old challengers: {e}")
-
-def champion_exists() -> bool:
-    try:
-        res = supabase.table("agent_params").select("id").eq("status", "champion").limit(1).execute()
-        return bool(res.data)
+        res = supabase.table("agent_params").select("*").eq("status","champion")\
+              .order("promoted_at",desc=True).limit(1).execute()
+        return res.data[0] if res.data else None
     except Exception:
-        return False
+        return None
 
-def promote_to_champion(version: int):
-    try:
-        # Demote existing champion
-        supabase.table("agent_params").update({"status": "retired"}).eq("status", "champion").execute()
-        supabase.table("agent_params").update({
-            "status": "champion",
-            "promoted_at": date.today().isoformat(),
-            "notes": "Auto-promoted because no previous champion existed"
-        }).eq("version", version).execute()
-        print(f"🏆 Version {version} promoted to CHAMPION")
-    except Exception as e:
-        print(f"⚠️  Champion promotion failed: {e}")
-
-def save_optimization_run(n_trials, n_valid, best, champion_version, challenger_version, stocks_used):
-    try:
-        supabase.table("optimization_runs").insert({
-            "run_date": date.today().isoformat(),
-            "n_trials": n_trials,
-            "n_valid_trials": n_valid,
-            "best_score": best["objective_score"] if best else None,
-            "best_profit_factor": best["profit_factor"] if best else None,
-            "best_win_rate": best["win_rate"] if best else None,
-            "best_avg_return": best["avg_return"] if best else None,
-            "champion_version": champion_version,
-            "challenger_version": challenger_version,
-            "stocks_used": stocks_used,
-        }).execute()
-    except Exception as e:
-        print(f"⚠️  Could not save optimization run: {e}")
+def save_candidate(params, metrics, version, run_date, train_start, train_end, val_start, val_end, rank):
+    supabase.table("agent_params").insert({
+        "version":        version,
+        "status":         "candidate",
+        "params_json":    json.dumps(params),
+        "objective_score":round(metrics.get("_objective", 0), 5),
+        "profit_factor":  round(metrics.get("profit_factor", 0), 3),
+        "win_rate":       round(metrics.get("win_rate", 0), 1),
+        "avg_return":     round(metrics.get("avg_return", 0), 2),
+        "max_drawdown":   round(metrics.get("max_drawdown", 0), 2),
+        "total_trades":   int(metrics.get("total_trades", 0)),
+        "train_start":    str(train_start)[:10],
+        "train_end":      str(train_end)[:10],
+        "valid_start":    str(val_start)[:10],
+        "valid_end":      str(val_end)[:10],
+        "run_date":       run_date,
+        "rank":           rank,
+        "notes":          f"Walk-forward rank {rank}",
+    }).execute()
 
 # ─────────────────────────────────────────────
 #  MAIN
 # ─────────────────────────────────────────────
 
-def main():
-    global N_TRIALS
+def run():
+    run_date = datetime.today().strftime("%Y-%m-%d")
+    print(f"\n🔬 Stock Agent Optimizer — {run_date}")
+    print(f"   Trials: {N_TRIALS}  |  Walk-forward windows: {N_WINDOWS}")
+    print(f"   Train: {TRAIN_MONTHS}m  Validate: {VALIDATE_MONTHS}m\n")
 
-    env_trials = os.getenv("N_TRIALS") or os.getenv("n_trials")
-    if env_trials:
-        try:
-            N_TRIALS = int(env_trials)
-            print(f"Using N_TRIALS from environment: {N_TRIALS}")
-        except Exception:
-            print(f"⚠️ Invalid N_TRIALS={env_trials!r}; using default {N_TRIALS}")
-
-    print("🧪 Starting Parameter Optimizer")
-    print(f"   Trials: {N_TRIALS} | Windows: {N_WINDOWS} | Stocks: {len(SAMPLE_STOCKS)}")
-
+    # 1. Fetch historical data
     all_data = fetch_all_data()
-    valid_count = sum(1 for d in all_data.values() if not d.empty)
-    if valid_count < 5:
-        print("❌ Not enough data to optimize")
-        sys.exit(1)
+    if sum(1 for d in all_data.values() if not d.empty) < 5:
+        print("  ❌ Not enough data to optimize. Aborting.")
+        return
 
-    # Run Optuna
-    study = optuna.create_study(direction="maximize")
-    study.optimize(make_objective(all_data), n_trials=N_TRIALS, show_progress_bar=False)
+    # Compute time range for logging
+    all_dates = [df.index for df in all_data.values() if not df.empty]
+    train_start = min(d.min() for d in all_dates)
+    train_end   = max(d.max() for d in all_dates)
+    val_start   = train_end - pd.DateOffset(months=VALIDATE_MONTHS * N_WINDOWS)
+    val_end     = train_end
 
-    # Valid trials only
-    completed = [t for t in study.trials if t.value is not None and t.value > -900]
-    completed = sorted(completed, key=lambda t: t.value, reverse=True)
-
-    if not completed:
-        print("❌ No valid trials produced")
-        save_optimization_run(N_TRIALS, 0, None, None, None, valid_count)
-        sys.exit(1)
-
-    print(f"\n✅ Completed {len(completed)} valid trials")
-    print("Top 5 objective scores:", [round(t.value, 4) for t in completed[:5]])
-
-    # Save top K candidates
-    base_version = get_next_version()
-    demote_old_challengers()
-
-    saved = []
-    for rank, trial in enumerate(completed[:TOP_K], 1):
-        version = base_version + rank - 1
-        params  = trial.params.copy()
-
-        # Re-add fixed fields
-        params["W_STRATEGY"] = 40
-
-        metrics = trial.user_attrs.get("metrics", {})
-
-        status = "challenger" if rank == 1 else "candidate"
-
-        row = {
-            "version": version,
-            "status": status,
-            "params_json": params,
-            "objective_score": float(trial.value),
-            "profit_factor": metrics.get("profit_factor"),
-            "win_rate": metrics.get("win_rate"),
-            "avg_return": metrics.get("avg_return"),
-            "max_drawdown": metrics.get("max_drawdown"),
-            "total_trades": metrics.get("total_trades"),
-            "train_start": (date.today() - timedelta(days=DATA_DAYS)).isoformat(),
-            "train_end": date.today().isoformat(),
-            "valid_start": None,
-            "valid_end": None,
-            "run_date": date.today().isoformat(),
-            "rank": rank,
-            "notes": (
-                f"Optuna WF score={trial.value:.4f}; "
-                f"trades={metrics.get('total_trades')}; "
-                f"next-open execution; SELL treated as exit/avoid-long"
-            ),
-        }
-        try:
-            supabase.table("agent_params").insert(row).execute()
-            saved.append(row)
-            print(
-                f"  Saved v{version} [{status}] "
-                f"score={trial.value:.4f} "
-                f"PF={metrics.get('profit_factor'):.2f} "
-                f"WR={metrics.get('win_rate'):.1f}% "
-                f"TR={metrics.get('total_trades')}"
-            )
-        except Exception as e:
-            print(f"⚠️  Could not save version {version}: {e}")
-
-    challenger_version = saved[0]["version"] if saved else None
-
-    # If no champion exists, auto-promote challenger
-    champion_version = None
-    if challenger_version and not champion_exists():
-        promote_to_champion(challenger_version)
-        champion_version = challenger_version
-    else:
-        try:
-            res = supabase.table("agent_params").select("version").eq("status", "champion").limit(1).execute()
-            if res.data:
-                champion_version = res.data[0]["version"]
-        except Exception:
-            pass
-
-    # Save run log
-    best = saved[0] if saved else None
-    save_optimization_run(
-        n_trials=N_TRIALS,
-        n_valid=len(completed),
-        best=best,
-        champion_version=champion_version,
-        challenger_version=challenger_version,
-        stocks_used=valid_count,
+    # 2. Run Optuna
+    print(f"  🔍 Running {N_TRIALS} Optuna trials...")
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(seed=42),
+        pruner=optuna.pruners.MedianPruner(n_warmup_steps=20),
     )
 
-    print("\n🏁 Optimization complete")
-    if challenger_version:
-        print(f"   Challenger: v{challenger_version}")
-    if champion_version:
-        print(f"   Champion:   v{champion_version}")
+    objective_fn = make_objective(all_data)
+
+    # Warm-start: add the default params as a first trial
+    default_params_for_optuna = {
+        "EMA_SHORT": 9, "EMA_LONG": 21,
+        "RSI_PERIOD": 14, "RSI_OVERSOLD": 42, "RSI_OVERBOUGHT": 62,
+        "MACD_FAST": 12, "MACD_SLOW": 26, "MACD_SIGNAL": 9,
+        "BB_PERIOD": 20, "BB_STD": 2.0,
+        "ATR_PERIOD": 14, "SUPERTREND_MULT": 3.0,
+        "BT_SL_PCT": 5.0, "BT_TARGET_PCT": 10.0, "BT_MAX_HOLD": 15,
+        "MIN_WEIGHTED_SCORE": 0.28,
+        "DONCHIAN_PERIOD": 20, "VOLUME_MULT": 1.5, "RSI_MIDLINE": 50,
+        "W_RSI": 20, "W_VOLUME": 15, "W_RR": 15, "W_REGIME": 10,
+    }
+    study.enqueue_trial(default_params_for_optuna)
+    study.optimize(objective_fn, n_trials=N_TRIALS, show_progress_bar=False)
+
+    # 3. Get top-K valid trials
+    valid_trials = [
+        t for t in study.trials
+        if t.value is not None and t.value > -900
+    ]
+    valid_trials.sort(key=lambda t: t.value, reverse=True)
+    top_trials = valid_trials[:TOP_K]
+
+    if not top_trials:
+        print("  ❌ No valid trials found. Check data quality.")
+        return
+
+    print(f"\n  ✅ Optimization complete")
+    print(f"     Best score : {top_trials[0].value:.4f}")
+    print(f"     Worst (top-{TOP_K}): {top_trials[-1].value:.4f}\n")
+    print(f"  {'Rank':<6} {'Score':>8}  {'PF':>6}  {'WR':>6}  {'AvgRet':>8}  {'MaxDD':>8}  {'Trades':>7}")
+    print(f"  {'─'*6} {'─'*8}  {'─'*6}  {'─'*6}  {'─'*8}  {'─'*8}  {'─'*7}")
+    for i, t in enumerate(top_trials, 1):
+        m = t.user_attrs.get("metrics", {})
+        print(f"  {i:<6} {t.value:>8.4f}  "
+              f"{m.get('profit_factor',0):>6.2f}  "
+              f"{m.get('win_rate',0):>5.1f}%  "
+              f"{m.get('avg_return',0):>+7.2f}%  "
+              f"{m.get('max_drawdown',0):>7.2f}%  "
+              f"{m.get('total_trades',0):>7}")
+
+    # 4. Save top-K candidates to Supabase
+    base_version = next_version()
+    print(f"\n  💾 Saving top-{TOP_K} candidates starting at version {base_version}...")
+    saved_ids = []
+    for i, trial in enumerate(top_trials, 1):
+        params = {**trial.params, "W_STRATEGY": 40}
+        metrics = {**trial.user_attrs.get("metrics", {}), "_objective": trial.value}
+        v = base_version + (i - 1)
+        save_candidate(params, metrics, v, run_date, train_start, train_end, val_start, val_end, rank=i)
+        saved_ids.append(v)
+        print(f"     Saved candidate v{v} (rank {i}, score={trial.value:.4f})")
+
+    best_version = base_version
+    champion = get_champion()
+
+    if champion is None:
+        # No champion yet → auto-promote to champion
+        supabase.table("agent_params")\
+            .update({"status": "champion", "promoted_at": run_date})\
+            .eq("version", best_version)\
+            .execute()
+        print(f"\n  👑 No champion existed → auto-promoted v{best_version} to CHAMPION")
+    else:
+        # Champion exists → promote best candidate as challenger
+        # First retire any existing challenger
+        supabase.table("agent_params")\
+            .update({"status": "retired"})\
+            .eq("status", "challenger")\
+            .execute()
+        supabase.table("agent_params")\
+            .update({"status": "challenger", "promoted_at": run_date})\
+            .eq("version", best_version)\
+            .execute()
+
+        champ_score = float(champion.get("objective_score", 0))
+        print(f"\n  ⚔️  Champion/Challenger mode:")
+        print(f"     Champion  : v{champion['version']}  score={champ_score:.4f}")
+        print(f"     Challenger: v{best_version}  score={top_trials[0].value:.4f}")
+        if top_trials[0].value > champ_score * 1.05:
+            print(f"\n  ℹ️  Challenger scores ≥5% better. Consider promoting via dashboard.")
+        else:
+            print(f"\n  ℹ️  Challenger not yet ≥5% better than champion. Monitor paper trades.")
+
+    # 6. Update optimization run log
+    supabase.table("optimization_runs").insert({
+        "run_date":           run_date,
+        "n_trials":           N_TRIALS,
+        "n_valid_trials":     len(valid_trials),
+        "best_score":         round(top_trials[0].value, 5),
+        "best_profit_factor": round(top_trials[0].user_attrs.get("metrics",{}).get("profit_factor",0), 3),
+        "best_win_rate":      round(top_trials[0].user_attrs.get("metrics",{}).get("win_rate",0), 1),
+        "best_avg_return":    round(top_trials[0].user_attrs.get("metrics",{}).get("avg_return",0), 2),
+        "champion_version":   champion["version"] if champion else best_version,
+        "challenger_version": best_version,
+        "stocks_used":        len([d for d in all_data.values() if not d.empty]),
+    }).execute()
+
+    print(f"\n  Done ✅ — results saved to Supabase\n")
 
 
 if __name__ == "__main__":
-    main()
+    run()
