@@ -13,6 +13,9 @@ CREATE TABLE IF NOT EXISTS recommendations (
     raw_score           INT,
     weighted_score_val  FLOAT,
     composite_score     FLOAT,
+    technical_score     FLOAT,
+    final_score_multiplier FLOAT,
+    fundamental_multiplier FLOAT,
     score_label         TEXT,
     score_breakdown     JSONB,
     signals             JSONB,
@@ -42,6 +45,10 @@ CREATE TABLE IF NOT EXISTS recommendations (
     target              FLOAT,
     risk_pct            FLOAT,
     reward_pct          FLOAT,
+    rr_ratio            FLOAT,
+    benchmark_return_pct FLOAT,
+    relative_return_pct  FLOAT,
+    benchmark_outperformance_rate FLOAT,
     volume              BIGINT,
     avg_volume          BIGINT,
     created_at          TIMESTAMPTZ DEFAULT NOW()
@@ -185,6 +192,13 @@ ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS news_headlines JSONB;
 ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS news_multiplier FLOAT;
 ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS fundamental_score FLOAT;
 ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS fundamental_warnings JSONB;
+ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS technical_score FLOAT;
+ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS final_score_multiplier FLOAT;
+ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS fundamental_multiplier FLOAT;
+ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS rr_ratio FLOAT;
+ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS benchmark_return_pct FLOAT;
+ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS relative_return_pct FLOAT;
+ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS benchmark_outperformance_rate FLOAT;
 ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS market_cap_cr FLOAT;
 ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS de_ratio FLOAT;
 ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS roe FLOAT;
@@ -192,10 +206,12 @@ ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS sector TEXT;
 
 ALTER TABLE agent_meta ADD COLUMN IF NOT EXISTS total_buys INT DEFAULT 0;
 ALTER TABLE agent_meta ADD COLUMN IF NOT EXISTS total_sells INT DEFAULT 0;
+ALTER TABLE agent_meta ADD COLUMN IF NOT EXISTS total_exits INT DEFAULT 0;
 ALTER TABLE agent_meta ADD COLUMN IF NOT EXISTS breadth_ratio FLOAT;
 ALTER TABLE agent_meta ADD COLUMN IF NOT EXISTS breadth_label TEXT;
 ALTER TABLE agent_meta ADD COLUMN IF NOT EXISTS breadth_buys INT DEFAULT 0;
 ALTER TABLE agent_meta ADD COLUMN IF NOT EXISTS breadth_sells INT DEFAULT 0;
+ALTER TABLE agent_meta ADD COLUMN IF NOT EXISTS breadth_exits INT DEFAULT 0;
 ALTER TABLE agent_meta ADD COLUMN IF NOT EXISTS breadth_neutral INT DEFAULT 0;
 
 CREATE TABLE IF NOT EXISTS stock_fundamentals (
@@ -226,7 +242,12 @@ CREATE TABLE IF NOT EXISTS backtest_simulations (
     exit_date           DATE,
     exit_reason         TEXT,
     actual_return_pct   FLOAT,
+    benchmark_return_pct FLOAT,
+    relative_return_pct  FLOAT,
+    benchmark_outperformance_rate FLOAT,
+    rr_ratio            FLOAT,
     composite_score     FLOAT,
+    technical_score     FLOAT,
     predicted_win_rate  FLOAT,
     was_win             BOOLEAN,
     days_held           INT,
@@ -241,6 +262,8 @@ CREATE TABLE IF NOT EXISTS simulation_meta (
     total_simulated     INT DEFAULT 0,
     actual_win_rate     FLOAT,
     actual_avg_return   FLOAT,
+    actual_avg_relative_return FLOAT,
+    benchmark_outperformance_rate FLOAT,
     pending_unprocessed INT DEFAULT 0,
     updated_at          TIMESTAMPTZ DEFAULT NOW()
 );
@@ -249,3 +272,40 @@ INSERT INTO simulation_meta (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
 ALTER TABLE stock_fundamentals DISABLE ROW LEVEL SECURITY;
 ALTER TABLE backtest_simulations DISABLE ROW LEVEL SECURITY;
 ALTER TABLE simulation_meta DISABLE ROW LEVEL SECURITY;
+
+
+-- v6 quant-quality upgrades: next-bar execution metadata, EXIT semantics, dynamic R:R,
+-- benchmark-relative metrics, and final score multipliers. Safe to re-run.
+ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS technical_score FLOAT;
+ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS final_score_multiplier FLOAT;
+ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS fundamental_multiplier FLOAT;
+ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS rr_ratio FLOAT;
+ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS benchmark_return_pct FLOAT;
+ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS relative_return_pct FLOAT;
+ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS benchmark_outperformance_rate FLOAT;
+
+ALTER TABLE backtest_simulations ADD COLUMN IF NOT EXISTS benchmark_return_pct FLOAT;
+ALTER TABLE backtest_simulations ADD COLUMN IF NOT EXISTS relative_return_pct FLOAT;
+ALTER TABLE backtest_simulations ADD COLUMN IF NOT EXISTS benchmark_outperformance_rate FLOAT;
+ALTER TABLE backtest_simulations ADD COLUMN IF NOT EXISTS rr_ratio FLOAT;
+ALTER TABLE backtest_simulations ADD COLUMN IF NOT EXISTS technical_score FLOAT;
+
+ALTER TABLE simulation_meta ADD COLUMN IF NOT EXISTS actual_avg_relative_return FLOAT;
+ALTER TABLE simulation_meta ADD COLUMN IF NOT EXISTS benchmark_outperformance_rate FLOAT;
+
+ALTER TABLE agent_meta ADD COLUMN IF NOT EXISTS total_exits INT DEFAULT 0;
+ALTER TABLE agent_meta ADD COLUMN IF NOT EXISTS breadth_exits INT DEFAULT 0;
+
+
+-- 2026-04-26: add dynamic R:R guard params to existing champion/challenger JSON
+-- These are JSON parameters, not table columns. They prevent BUY recommendations
+-- from showing stop downside larger than target upside.
+UPDATE agent_params
+SET params_json = jsonb_set(COALESCE(params_json, '{}'::jsonb), '{MIN_RR_RATIO}', '1.5'::jsonb, true)
+WHERE status IN ('champion', 'challenger')
+  AND NOT (COALESCE(params_json, '{}'::jsonb) ? 'MIN_RR_RATIO');
+
+UPDATE agent_params
+SET params_json = jsonb_set(COALESCE(params_json, '{}'::jsonb), '{MAX_RISK_PCT}', '8.0'::jsonb, true)
+WHERE status IN ('champion', 'challenger')
+  AND NOT (COALESCE(params_json, '{}'::jsonb) ? 'MAX_RISK_PCT');
