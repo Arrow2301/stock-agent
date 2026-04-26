@@ -582,7 +582,7 @@ def hf_finbert_score(texts: list[str]) -> tuple[float, str, str]:
     Returns score in [-1, +1], label, main headline.
     Requires HF_TOKEN. Falls back to neutral if unavailable.
     """
-        if not texts:
+    if not texts:
         return 0.0, "neutral", ""
 
     token = os.getenv("HF_TOKEN", "").strip()
