@@ -193,13 +193,18 @@ def _dynamic_levels(df, signal_idx, entry_price, p):
     stop_buf = float(p.get("ATR_STOP_BUFFER", 0.50))
     target_buf = float(p.get("ATR_TARGET_BUFFER", 0.50))
     max_risk_atr = float(p.get("MAX_RISK_ATR", 3.00))
+    max_risk_pct = float(p.get("MAX_RISK_PCT", 8.00))
+    min_rr_ratio = float(p.get("MIN_RR_RATIO", 1.50))
     sl = (support - stop_buf * atr_now) if support is not None and support < entry_price else entry_price - 1.25 * atr_now
-    sl = max(sl, entry_price - max_risk_atr * atr_now)
+    sl = max(sl, entry_price - max_risk_atr * atr_now, entry_price * (1 - max_risk_pct / 100.0))
     if sl >= entry_price:
-        sl = entry_price - 1.25 * atr_now
+        sl = max(entry_price - 1.25 * atr_now, entry_price * (1 - max_risk_pct / 100.0))
     tgt = (resistance + target_buf * atr_now) if resistance is not None and resistance > entry_price else entry_price + 1.75 * atr_now
     if tgt <= entry_price:
         tgt = entry_price + 1.75 * atr_now
+    actual_risk = entry_price - sl
+    if actual_risk > 0 and min_rr_ratio > 0:
+        tgt = max(tgt, entry_price + actual_risk * min_rr_ratio)
     return sl, tgt
 
 
@@ -378,6 +383,12 @@ def make_objective(all_data):
             "BT_TARGET_PCT":      trial.suggest_float("BT_TARGET_PCT", 4.0, 18.0),
             "BT_MAX_HOLD":        trial.suggest_int(  "BT_MAX_HOLD",   3,  25),
             "MIN_WEIGHTED_SCORE": trial.suggest_float("MIN_WEIGHTED_SCORE",0.10,0.55),
+            "RR_LOOKBACK":        trial.suggest_int(  "RR_LOOKBACK", 14, 35),
+            "ATR_STOP_BUFFER":    trial.suggest_float("ATR_STOP_BUFFER", 0.25, 1.00),
+            "ATR_TARGET_BUFFER":  trial.suggest_float("ATR_TARGET_BUFFER", 0.25, 1.25),
+            "MAX_RISK_ATR":       trial.suggest_float("MAX_RISK_ATR", 1.50, 3.50),
+            "MAX_RISK_PCT":       trial.suggest_float("MAX_RISK_PCT", 4.00, 10.00),
+            "MIN_RR_RATIO":       trial.suggest_float("MIN_RR_RATIO", 1.20, 2.20),
             # New strategy params
             "DONCHIAN_PERIOD":    trial.suggest_int(  "DONCHIAN_PERIOD",  10, 40),
             "VOLUME_MULT":        trial.suggest_float("VOLUME_MULT",      1.2,  3.0),
@@ -535,6 +546,8 @@ def run():
         "ATR_PERIOD": 14, "SUPERTREND_MULT": 3.0,
         "BT_SL_PCT": 5.0, "BT_TARGET_PCT": 10.0, "BT_MAX_HOLD": 15,
         "MIN_WEIGHTED_SCORE": 0.28,
+        "RR_LOOKBACK": 20, "ATR_STOP_BUFFER": 0.50, "ATR_TARGET_BUFFER": 0.50,
+        "MAX_RISK_ATR": 3.00, "MAX_RISK_PCT": 8.00, "MIN_RR_RATIO": 1.50,
         "DONCHIAN_PERIOD": 20, "VOLUME_MULT": 1.5, "RSI_MIDLINE": 50,
         "W_RSI": 20, "W_VOLUME": 15, "W_RR": 15, "W_REGIME": 10,
     }

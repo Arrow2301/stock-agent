@@ -118,7 +118,9 @@ DEFAULT_PARAMS = {
     "ATR_STOP_BUFFER":    0.50,
     "ATR_TARGET_BUFFER":  0.50,
     "MAX_RISK_ATR":       3.00,
-    "MIN_WEIGHTED_SCORE": 0.30,
+    "MAX_RISK_PCT":       8.00,
+    "MIN_RR_RATIO":       1.50,
+    "MIN_WEIGHTED_SCORE": 0.08,
     "W_STRATEGY":         40,
     "W_RSI":              20,
     "W_VOLUME":           15,
@@ -343,6 +345,8 @@ def dynamic_trade_levels(df: pd.DataFrame, signal_idx: int, entry_price: float, 
     stop_buf = float(p.get("ATR_STOP_BUFFER", 0.50))
     target_buf = float(p.get("ATR_TARGET_BUFFER", 0.50))
     max_risk_atr = float(p.get("MAX_RISK_ATR", 3.00))
+    max_risk_pct = float(p.get("MAX_RISK_PCT", 8.00))
+    min_rr_ratio = float(p.get("MIN_RR_RATIO", 1.50))
 
     # Prior support/resistance exclude the signal bar itself. Indicators may
     # use the signal close; the order still waits until the next open.
@@ -368,10 +372,16 @@ def dynamic_trade_levels(df: pd.DataFrame, signal_idx: int, entry_price: float, 
         else:
             sl = fallback_sl
 
-        # Avoid pathological stale support making risk unbounded.
-        sl = max(sl, entry_price - max_risk_atr * atr_now)
+        # Avoid pathological stale support making risk unbounded. Also cap
+        # cash risk as a percentage of entry so a far-away support level does
+        # not produce a stop whose downside dwarfs the target.
+        sl = max(
+            sl,
+            entry_price - max_risk_atr * atr_now,
+            entry_price * (1 - max_risk_pct / 100.0),
+        )
         if sl >= entry_price:
-            sl = fallback_sl
+            sl = max(fallback_sl, entry_price * (1 - max_risk_pct / 100.0))
 
         if resistance is not None and resistance > entry_price:
             tgt = resistance + target_buf * atr_now
@@ -380,6 +390,17 @@ def dynamic_trade_levels(df: pd.DataFrame, signal_idx: int, entry_price: float, 
 
         if tgt <= entry_price:
             tgt = fallback_tgt
+
+        # If the nearest resistance gives less upside than the stop risk, do
+        # not publish an unattractive BUY plan. Keep the stop dynamic, then
+        # project the target to the minimum acceptable reward/risk threshold.
+        # This is a floor, not a fixed 2:1 template: stronger resistance/ATR
+        # targets can still produce higher R:R naturally.
+        actual_risk = entry_price - sl
+        if actual_risk > 0 and min_rr_ratio > 0:
+            min_tgt = entry_price + actual_risk * min_rr_ratio
+            if tgt < min_tgt:
+                tgt = min_tgt
 
     risk_pct = (entry_price - sl) / entry_price * 100 if sl and sl < entry_price else None
     reward_pct = (tgt - entry_price) / entry_price * 100 if tgt and tgt > entry_price else None
