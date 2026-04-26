@@ -108,7 +108,7 @@ def news_color(label):
 
 def status_badge(label, kind="neutral"):
     palette = {
-        "buy": "#26a69a", "sell": "#ef5350", "champion": "#ffd54f",
+        "buy": "#26a69a", "exit": "#ef5350", "sell": "#ef5350", "champion": "#ffd54f",
         "challenger": "#90caf9", "candidate": "#c5e1a5", "retired": "#e0e0e0",
         "bullish": "#a5d6a7", "bearish": "#ef9a9a", "neutral": "#eeeeee",
     }
@@ -153,6 +153,8 @@ def load_recs(target_date=None, days_back=None):
     if not res.data:
         return pd.DataFrame()
     df = pd.DataFrame(res.data)
+    if "action" in df.columns:
+        df["action"] = df["action"].replace({"SELL": "EXIT"})
     for col in ["signals", "backtest", "score_breakdown", "strategy_weights",
                 "news_headlines", "fundamental_warnings"]:
         if col in df.columns:
@@ -162,6 +164,9 @@ def load_recs(target_date=None, days_back=None):
         "reward_pct", "win_rate", "avg_return", "median_return", "profit_factor",
         "max_drawdown", "composite_score", "weighted_score_val", "raw_score",
         "avg_trades", "news_score", "news_multiplier", "fundamental_score",
+        "technical_score", "final_score_multiplier", "fundamental_multiplier",
+        "rr_ratio", "benchmark_return_pct", "relative_return_pct",
+        "benchmark_outperformance_rate",
         "market_cap_cr", "pe_ratio", "de_ratio", "revenue_growth", "roe", "streak",
     ]
     for col in numeric_cols:
@@ -228,7 +233,11 @@ def load_simulations(days_back=90):
     if not res.data:
         return pd.DataFrame()
     df = pd.DataFrame(res.data)
-    for col in ["actual_return_pct", "composite_score", "predicted_win_rate"]:
+    if "action" in df.columns:
+        df["action"] = df["action"].replace({"SELL": "EXIT"})
+    for col in ["actual_return_pct", "composite_score", "technical_score", "predicted_win_rate",
+                "benchmark_return_pct", "relative_return_pct",
+                "benchmark_outperformance_rate", "rr_ratio"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
@@ -461,6 +470,94 @@ def render_fundamentals_panel(row):
     f4.metric("ROE",        f"{roe:.1f}%" if roe  else "—")
     f5.metric("Rev. Growth",f"{rg:+.1f}%" if rg  else "—")
 
+
+def render_why_signal(row):
+    """Human-readable explanation of the current recommendation."""
+    action = str(row.get("action", "")).upper().replace("SELL", "EXIT")
+    sigs = row.get("signals", {}) or {}
+    active_names = [name for name, val in sigs.items()
+                    if (action == "BUY" and val == 1) or (action == "EXIT" and val == -1)]
+    active_text = ", ".join(active_names) if active_names else str(row.get("active_strategies", "—") or "—")
+
+    rsi_v = safe_float(row.get("rsi"), None)
+    if rsi_v is None:
+        rsi_text = "RSI is unavailable."
+    elif action == "BUY":
+        if rsi_v < 35:
+            rsi_text = f"RSI {rsi_v:.1f} is deeply oversold, so the setup may be a rebound candidate."
+        elif rsi_v < 50:
+            rsi_text = f"RSI {rsi_v:.1f} is below midline, giving room for a recovery if momentum improves."
+        elif rsi_v < 65:
+            rsi_text = f"RSI {rsi_v:.1f} is constructive without being extremely overbought."
+        else:
+            rsi_text = f"RSI {rsi_v:.1f} is elevated, so chase risk is higher."
+    else:
+        if rsi_v > 65:
+            rsi_text = f"RSI {rsi_v:.1f} is stretched, supporting an EXIT / avoid-new-long interpretation."
+        elif rsi_v < 45:
+            rsi_text = f"RSI {rsi_v:.1f} shows weak momentum, supporting caution on fresh longs."
+        else:
+            rsi_text = f"RSI {rsi_v:.1f} is neutral; the EXIT signal mainly comes from strategy agreement/regime."
+
+    vol = safe_float(row.get("volume"), 0)
+    avg_vol = safe_float(row.get("avg_volume"), 0)
+    vol_ratio = vol / avg_vol if avg_vol > 0 else None
+    if vol_ratio is None:
+        volume_text = "Volume context is unavailable."
+    elif vol_ratio >= 1.5:
+        volume_text = f"Volume is {vol_ratio:.1f}× its 20-day average, so participation is strong."
+    elif vol_ratio >= 0.8:
+        volume_text = f"Volume is {vol_ratio:.1f}× its 20-day average, broadly normal."
+    else:
+        volume_text = f"Volume is only {vol_ratio:.1f}× its 20-day average, so conviction is lighter."
+
+    rr = safe_float(row.get("rr_ratio"), None)
+    risk = safe_float(row.get("risk_pct"), None)
+    reward = safe_float(row.get("reward_pct"), None)
+    sl = row.get("stop_loss")
+    tgt = row.get("target")
+    rr_text = (
+        f"Dynamic levels use prior support/resistance plus ATR: stop {fmt_inr(sl)}, "
+        f"target {fmt_inr(tgt)}, risk {fmt_pct(risk)}, reward {fmt_pct(reward)}, R:R {rr:.2f}."
+        if rr is not None else
+        "Dynamic R:R levels are unavailable for this row."
+    )
+
+    regime = str(row.get("market_regime", "—"))
+    tech = safe_float(row.get("technical_score"), None)
+    comp = safe_float(row.get("composite_score"), None)
+    news_mult = safe_float(row.get("news_multiplier"), 1.0)
+    fund_mult = safe_float(row.get("fundamental_multiplier"), 1.0)
+    final_mult = safe_float(row.get("final_score_multiplier"), news_mult * fund_mult)
+    fund_score = safe_float(row.get("fundamental_score"), 50)
+    news_label = str(row.get("news_label", "neutral")).upper()
+
+    bench_ret = safe_float(row.get("benchmark_return_pct"), None)
+    rel_ret = safe_float(row.get("relative_return_pct"), None)
+    outperf = safe_float(row.get("benchmark_outperformance_rate"), None)
+    if rel_ret is None:
+        bench_text = "NIFTY-relative backtest data is not available yet for this signal."
+    else:
+        bench_text = (
+            f"Recent strategy backtests averaged {fmt_pct(row.get('avg_return'))} versus NIFTY {fmt_pct(bench_ret)}, "
+            f"for relative return {fmt_pct(rel_ret)} and outperformance rate {fmt_pct(outperf, 1, signed=False)}."
+        )
+
+    with st.expander("❓ Why this signal?", expanded=True):
+        if action == "EXIT":
+            st.warning("EXIT means close/avoid fresh long exposure. It is not a short-sell recommendation.")
+        st.markdown(f"**Action:** {action} — active strategies: {active_text}")
+        st.markdown(f"**Technical score:** {fmt_num(tech, 1)} → **final score:** {fmt_num(comp, 1)} after controlled multipliers.")
+        st.markdown(f"**RSI:** {rsi_text}")
+        st.markdown(f"**Volume:** {volume_text}")
+        st.markdown(f"**Market regime:** {regime}; BUY signals benefit from bullish regimes, EXIT signals benefit from bearish/weak regimes.")
+        st.markdown(f"**Risk/reward:** {rr_text}")
+        st.markdown(
+            f"**Fundamentals/news:** fundamental score {fund_score:.0f}/100 (×{fund_mult:.2f}), "
+            f"news {news_label} (×{news_mult:.2f}); combined final multiplier ×{final_mult:.2f}."
+        )
+        st.markdown(f"**Benchmark vs NIFTY:** {bench_text}")
+
 # ─────────────────────────────────────────────
 #  SIDEBAR
 # ─────────────────────────────────────────────
@@ -476,12 +573,12 @@ with st.sidebar:
 
         # Breadth gauge
         b_buy = safe_int(meta.get("breadth_buys", 0))
-        b_sell= safe_int(meta.get("breadth_sells", 0))
+        b_sell= safe_int(meta.get("breadth_exits", meta.get("breadth_sells", 0)))
         b_neu = safe_int(meta.get("breadth_neutral", 0))
         if b_buy + b_sell > 0:
             st.plotly_chart(breadth_gauge(b_buy, b_sell, b_neu),
                             use_container_width=True, key="sidebar_breadth")
-            st.caption(f"Breadth: {b_buy} BUY / {b_sell} SELL / {b_neu} Neutral")
+            st.caption(f"Breadth: {b_buy} BUY / {b_sell} EXIT / {b_neu} Neutral")
     else:
         st.warning("Agent hasn't run yet")
 
@@ -531,13 +628,13 @@ if page == "📊 Today's Signals":
         st.stop()
 
     buys  = recs[recs.action == "BUY"].copy()
-    sells = recs[recs.action == "SELL"].copy()
+    exits = recs[recs.action == "EXIT"].copy()
 
     # ── Header metrics
     h1, h2, h3, h4, h5, h6 = st.columns(6)
     h1.metric("Signals",   len(recs))
     h2.metric("Buys",      len(buys))
-    h3.metric("Sells",     len(sells))
+    h3.metric("Exits",     len(exits))
     h4.metric("Top Score", f"{safe_float(recs.composite_score.max()):.0f}/100")
     h5.metric("Open P&L",  f"₹{portfolio_snapshot['open_pnl']:+,.0f}")
     h6.metric("Market",    meta.get("market_regime", "?"))
@@ -548,7 +645,7 @@ if page == "📊 Today's Signals":
         min_cs          = f1.slider("Min Composite Score",    0, 100, 30)
         min_wr          = f2.slider("Min Positive Return %",  0, 100, 40)
         min_pf          = f3.slider("Min Profit Factor",      0.0, 5.0, 0.8, 0.1)
-        action_filter   = f4.selectbox("Action", ["All","BUY","SELL"])
+        action_filter   = f4.selectbox("Action", ["All","BUY","EXIT"])
 
         f5, f6, f7, f8 = st.columns(4)
         ticker_q        = f5.text_input("Ticker search", "")
@@ -557,15 +654,22 @@ if page == "📊 Today's Signals":
         regime_filter   = f7.selectbox("Regime filter",
                                        ["All","BULLISH","NEUTRAL","BEARISH","UNKNOWN"])
         sort_col        = f8.selectbox("Sort by",
-                                       ["composite_score","win_rate","profit_factor",
+                                       ["composite_score","technical_score","relative_return_pct",
+                                        "benchmark_outperformance_rate","win_rate","profit_factor",
                                         "avg_return","streak","fundamental_score",
-                                        "news_score","rsi","reward_pct"], index=0)
+                                        "news_score","rsi","rr_ratio","reward_pct"], index=0)
 
         filtered = recs.copy()
+        filtered = filtered[filtered.composite_score.fillna(0) >= min_cs]
+        # Win-rate and profit-factor are long-trade BUY metrics. EXIT rows are
+        # avoid-new-long signals, not short trades, so do not filter them out
+        # using long-trade performance metrics.
         filtered = filtered[
-            (filtered.composite_score.fillna(0) >= min_cs) &
-            (filtered.win_rate.fillna(0)         >= min_wr) &
-            (filtered.profit_factor.fillna(0)    >= min_pf)
+            (filtered.action != "BUY") |
+            (
+                (filtered.win_rate.fillna(0)      >= min_wr) &
+                (filtered.profit_factor.fillna(0) >= min_pf)
+            )
         ]
         if action_filter != "All":
             filtered = filtered[filtered.action == action_filter]
@@ -588,21 +692,25 @@ if page == "📊 Today's Signals":
     # ── Leaderboard table
     st.subheader("📋 Signal Leaderboard")
     board = filtered.copy()
-    board_cols = ["ticker", "action", "composite_score", "score_label",
+    board_cols = ["ticker", "action", "composite_score", "technical_score", "score_label",
                   "streak", "win_rate", "profit_factor", "avg_return",
-                  "news_label", "fundamental_score", "sector",
-                  "rsi", "price", "stop_loss", "target",
-                  "reward_pct", "risk_pct", "market_regime"]
+                  "news_label", "fundamental_score", "final_score_multiplier", "sector",
+                  "rsi", "price", "stop_loss", "target", "rr_ratio",
+                  "reward_pct", "risk_pct", "relative_return_pct",
+                  "benchmark_outperformance_rate", "market_regime"]
     board_cols = [c for c in board_cols if c in board.columns]
     board_show = board[board_cols].rename(columns={
         "ticker": "Ticker", "action": "Action",
-        "composite_score": "Score", "score_label": "Label",
+        "composite_score": "Final Score", "technical_score": "Tech Score", "score_label": "Label",
         "streak": "Streak", "win_rate": "Win %",
         "profit_factor": "PF", "avg_return": "Avg Ret %",
         "news_label": "News", "fundamental_score": "Fund Score",
+        "final_score_multiplier": "Final ×",
         "sector": "Sector", "rsi": "RSI",
         "price": "Price ₹", "stop_loss": "SL ₹", "target": "Target ₹",
-        "reward_pct": "Reward %", "risk_pct": "Risk %",
+        "rr_ratio": "R:R", "reward_pct": "Reward %", "risk_pct": "Risk %",
+        "relative_return_pct": "Rel vs NIFTY %",
+        "benchmark_outperformance_rate": "NIFTY Outperf %",
         "market_regime": "Regime",
     })
     st.dataframe(board_show, use_container_width=True, hide_index=True)
@@ -617,7 +725,7 @@ if page == "📊 Today's Signals":
     # Score + streak + news warning badge
     badges_html = (score_badge(sel.composite_score, sel.score_label) + " &nbsp; " +
                    streak_badge(safe_int(sel.get("streak"), 1)) + " &nbsp; " +
-                   status_badge(sel.action, "buy" if sel.action == "BUY" else "sell"))
+                   status_badge(sel.action, "buy" if sel.action == "BUY" else "exit"))
     st.markdown(badges_html, unsafe_allow_html=True)
     st.markdown("")
 
@@ -653,17 +761,27 @@ if page == "📊 Today's Signals":
         m1.metric("1D Change",      fmt_pct(sel.get("change_1d")))
         m1.metric("5D Change",      fmt_pct(sel.get("change_5d")))
         m2.metric("RSI",            fmt_num(sel.get("rsi"), 1))
-        m2.metric("Win Rate",       fmt_pct(sel.get("win_rate"),    1, signed=False))
-        m2.metric("Profit Factor",  fmt_num(sel.get("profit_factor"), 2))
+        m2.metric("Tech Score",     fmt_num(sel.get("technical_score"), 1))
+        m2.metric("Final ×",        f"×{safe_float(sel.get('final_score_multiplier'), 1.0):.2f}")
         m3.metric("Stop Loss",      fmt_inr(sel.get("stop_loss")))
         m3.metric("Target",         fmt_inr(sel.get("target")))
-        m3.metric("Reward",         fmt_pct(sel.get("reward_pct")))
+        m3.metric("R:R",            fmt_num(sel.get("rr_ratio"), 2))
         m4.metric("Risk",           fmt_pct(sel.get("risk_pct")))
-        m4.metric("Avg Return",     fmt_pct(sel.get("avg_return")))
-        m4.metric("Median Return",  fmt_pct(sel.get("median_return")))
+        m4.metric("Reward",         fmt_pct(sel.get("reward_pct")))
+        m4.metric("Rel vs NIFTY",   fmt_pct(sel.get("relative_return_pct")))
+
+        if sel.get("action") == "BUY":
+            perf1, perf2, perf3 = st.columns(3)
+            perf1.metric("Win Rate",       fmt_pct(sel.get("win_rate"), 1, signed=False))
+            perf2.metric("Profit Factor",  fmt_num(sel.get("profit_factor"), 2))
+            perf3.metric("NIFTY Outperf",  fmt_pct(sel.get("benchmark_outperformance_rate"), 1, signed=False))
+        else:
+            st.info("EXIT metrics are not shown as short-trade win-rate/profit-factor. EXIT is a close/avoid-new-long signal.")
 
         st.caption(f"Strategies: {sel.get('active_strategies','—')}")
         st.caption(f"Regime: {sel.get('market_regime','—')} | Params: {sel.get('param_version','—')}")
+
+        render_why_signal(sel)
 
         # News panel
         st.divider()
@@ -692,36 +810,43 @@ if page == "📊 Today's Signals":
     strat_rows = []
     for name, val in sigs.items():
         b = bts.get(name, {})
+        sig_label = "BUY" if val == 1 else ("EXIT" if val == -1 else "None")
+        is_exit_active = (sel.get("action") == "EXIT" and val == -1)
         strat_rows.append({
             "Strategy":       name,
-            "Signal":         "BUY" if val == 1 else ("SELL" if val == -1 else "None"),
+            "Signal":         sig_label,
             "Weight":         safe_float(wts.get(name, 0)),
-            "Win Rate %":     safe_float(b.get("win_rate", 0)),
-            "Avg Return %":   safe_float(b.get("avg_return", 0)),
-            "Median Ret %":   safe_float(b.get("median_return", 0)),
-            "Profit Factor":  safe_float(b.get("profit_factor", 0)),
+            "Metric Scope":   "N/A for EXIT" if is_exit_active else "Long BUY",
+            "Win Rate %":     None if is_exit_active else safe_float(b.get("win_rate", 0)),
+            "Avg Return %":   None if is_exit_active else safe_float(b.get("avg_return", 0)),
+            "Median Ret %":   None if is_exit_active else safe_float(b.get("median_return", 0)),
+            "Profit Factor":  None if is_exit_active else safe_float(b.get("profit_factor", 0)),
             "Trades":         safe_int(b.get("trades", 0)),
             "SL Exits":       safe_int(b.get("sl_exits", 0)),
             "Target Exits":   safe_int(b.get("target_exits", 0)),
+            "Signal Exits":   safe_int(b.get("exit_signal_exits", 0)),
         })
     st.dataframe(pd.DataFrame(strat_rows), use_container_width=True, hide_index=True)
 
     # ── Paper trade form
     st.subheader("📝 Paper Trade")
-    pb1, pb2, pb3, pb4 = st.columns(4)
-    qty   = pb1.number_input("Qty", min_value=1, value=10, key=f"qty_{sel.ticker}")
-    price = pb2.number_input("Price (₹)", value=safe_float(sel.get("price"), 0.0),
-                              key=f"px_{sel.ticker}")
-    sl_in = pb3.number_input("Stop Loss (₹)", value=safe_float(sel.get("stop_loss"), 0.0),
-                              key=f"sl_{sel.ticker}")
-    tg_in = pb4.number_input("Target (₹)", value=safe_float(sel.get("target"), 0.0),
-                              key=f"tg_{sel.ticker}")
-    notes = st.text_input("Notes", value=str(sel.get("active_strategies", "")),
-                           key=f"nt_{sel.ticker}")
-    if st.button(f"🟢 Paper Buy {sel.ticker}", key=f"buy_{sel.ticker}"):
-        paper_buy(sel.ticker, price, qty, sl_in, tg_in, notes, str(sel.get("id", "")))
-        st.success(f"✅ Paper bought {qty} × {sel.ticker} @ ₹{price:.2f}")
-        st.balloons()
+    if sel.get("action") == "BUY":
+        pb1, pb2, pb3, pb4 = st.columns(4)
+        qty   = pb1.number_input("Qty", min_value=1, value=10, key=f"qty_{sel.ticker}")
+        price = pb2.number_input("Price (₹)", value=safe_float(sel.get("price"), 0.0),
+                                  key=f"px_{sel.ticker}")
+        sl_in = pb3.number_input("Stop Loss (₹)", value=safe_float(sel.get("stop_loss"), 0.0),
+                                  key=f"sl_{sel.ticker}")
+        tg_in = pb4.number_input("Target (₹)", value=safe_float(sel.get("target"), 0.0),
+                                  key=f"tg_{sel.ticker}")
+        notes = st.text_input("Notes", value=str(sel.get("active_strategies", "")),
+                               key=f"nt_{sel.ticker}")
+        if st.button(f"🟢 Paper Buy {sel.ticker}", key=f"buy_{sel.ticker}"):
+            paper_buy(sel.ticker, price, qty, sl_in, tg_in, notes, str(sel.get("id", "")))
+            st.success(f"✅ Paper bought {qty} × {sel.ticker} @ ₹{price:.2f}")
+            st.balloons()
+    else:
+        st.info("This is an EXIT / avoid-new-long signal, so the dashboard does not create a new long paper trade from it.")
 
 # ═══════════════════════════════════════════════
 #  PAGE: PAPER PORTFOLIO
@@ -827,20 +952,21 @@ elif page == "📅 Signal History":
     if hist.empty:
         st.info("No history yet."); st.stop()
 
-    act_f = st.selectbox("Action filter", ["All","BUY","SELL"])
+    act_f = st.selectbox("Action filter", ["All","BUY","EXIT"])
     if act_f != "All":
         hist = hist[hist.action == act_f]
 
     daily = hist.groupby(["date","action"]).size().reset_index(name="count")
     fig = px.bar(daily, x="date", y="count", color="action",
-                  color_discrete_map={"BUY":"#26a69a","SELL":"#ef5350"},
+                  color_discrete_map={"BUY":"#26a69a","EXIT":"#ef5350","SELL":"#ef5350"},
                   title="Daily signal count")
     fig.update_layout(height=250, margin=dict(t=30,b=10,l=0,r=0),
                        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
     st.plotly_chart(fig, use_container_width=True)
 
-    show_cols = ["date","ticker","action","composite_score","score_label","streak",
-                 "win_rate","avg_return","profit_factor","news_label","fundamental_score",
+    show_cols = ["date","ticker","action","composite_score","technical_score","score_label","streak",
+                 "win_rate","avg_return","profit_factor","relative_return_pct",
+                 "benchmark_outperformance_rate","news_label","fundamental_score",
                  "sector","rsi","active_strategies","market_regime","param_version"]
     show_cols = [c for c in show_cols if c in hist.columns]
     st.dataframe(hist[show_cols], use_container_width=True, hide_index=True)
@@ -1076,12 +1202,17 @@ elif page == "🔬 Backtest Lab":
     wr     = len(wins) / total * 100 if total > 0 else 0
     avg_r  = sims.actual_return_pct.mean()
 
-    s1, s2, s3, s4, s5 = st.columns(5)
+    rel_avg = sims.relative_return_pct.mean() if "relative_return_pct" in sims.columns else np.nan
+    outperf_rate = (sims.relative_return_pct.dropna().gt(0).mean() * 100
+                    if "relative_return_pct" in sims.columns and sims.relative_return_pct.notna().any() else np.nan)
+    s1, s2, s3, s4, s5, s6, s7 = st.columns(7)
     s1.metric("Total Trades",    total)
     s2.metric("Wins",            len(wins))
     s3.metric("Losses",          len(losses))
     s4.metric("Actual Win Rate", f"{wr:.1f}%")
     s5.metric("Actual Avg Return", f"{avg_r:+.2f}%")
+    s6.metric("Avg Rel vs NIFTY", fmt_pct(rel_avg))
+    s7.metric("NIFTY Outperf", fmt_pct(outperf_rate, 1, signed=False))
 
     st.divider()
 
@@ -1118,14 +1249,14 @@ elif page == "🔬 Backtest Lab":
 
     # ── Composite score vs actual return
     st.subheader("📈 Composite Score vs Actual Return %")
-    st.caption("Does a higher signal score actually predict better outcomes?")
+    st.caption("Does a higher signal score actually predict better outcomes? Relative-return fields compare realised return with ^NSEI over the same holding window.")
     if "composite_score" in sims.columns and sims.composite_score.notna().any():
         sims_plot = sims.dropna(subset=["composite_score","actual_return_pct"]).copy()
         fig_scatter = px.scatter(
             sims_plot,
             x="composite_score", y="actual_return_pct",
             color="actual_return_pct", color_continuous_scale="RdYlGn",
-            hover_data=["ticker","signal_date","exit_reason","days_held"],
+            hover_data=[c for c in ["ticker","signal_date","exit_reason","days_held","benchmark_return_pct","relative_return_pct","rr_ratio"] if c in sims_plot.columns],
             title="Signal Composite Score vs Realised Return",
         )
         fig_scatter.add_hline(y=0, line_dash="dash", line_color="gray")
@@ -1175,13 +1306,19 @@ elif page == "🔬 Backtest Lab":
     st.divider()
     st.subheader("📋 Recent Simulated Trades")
     disp_cols = ["ticker","signal_date","exit_date","entry_price","exit_price",
-                 "actual_return_pct","exit_reason","days_held",
-                 "composite_score","predicted_win_rate","was_win"]
+                 "actual_return_pct","benchmark_return_pct","relative_return_pct",
+                 "benchmark_outperformance_rate","rr_ratio","exit_reason","days_held",
+                 "composite_score","technical_score","predicted_win_rate","was_win"]
     disp_cols = [c for c in disp_cols if c in sims.columns]
     st.dataframe(
         sims[disp_cols].head(50).style.format({
             "actual_return_pct":  "{:+.2f}%",
+            "benchmark_return_pct":"{:+.2f}%",
+            "relative_return_pct": "{:+.2f}%",
+            "benchmark_outperformance_rate": "{:.1f}%",
+            "rr_ratio":           "{:.2f}",
             "composite_score":    "{:.1f}",
+            "technical_score":    "{:.1f}",
             "predicted_win_rate": "{:.1f}%",
             "entry_price":        "₹{:.2f}",
             "exit_price":         "₹{:.2f}",
