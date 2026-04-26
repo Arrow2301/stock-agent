@@ -868,7 +868,7 @@ elif page == "📈 Strategy Stats":
     f1, f2 = st.columns(2)
     days_back  = f1.slider("History window (days)", 7, 180, 60)
     strat_mode = f2.selectbox("Strategy view",
-                               ["All strategies", "Current live only"], index=0)
+                               ["Current live only", "All strategies (incl. retired)"], index=0)
 
     if "date" in all_recs.columns:
         cutoff = (date.today() - timedelta(days=days_back)).isoformat()
@@ -885,7 +885,7 @@ elif page == "📈 Strategy Stats":
             if not isinstance(bt, dict):
                 continue
             for name, stats in bt.items():
-                if strat_mode == "Current live only" and name not in LIVE_STRATEGIES:
+                if "Current live only" in strat_mode and name not in LIVE_STRATEGIES:
                     continue
                 if not isinstance(stats, dict):
                     continue
@@ -1004,10 +1004,19 @@ elif page == "📈 Strategy Stats":
         st.divider()
         st.subheader("🔗 Composite Score vs Realised P&L")
         rec_ids = closed_port.recommendation_id.astype(str).tolist()
-        rc = sb.table("recommendations")\
-               .select("id,composite_score,score_label").in_("id", rec_ids).execute()
-        if rc.data:
-            rc_df = pd.DataFrame(rc.data)
+        # Chunk to avoid PostgREST URL length limit (crashes with large ID lists)
+        rc_data = []
+        chunk_size = 50
+        for i in range(0, len(rec_ids), chunk_size):
+            try:
+                chunk = rec_ids[i:i + chunk_size]
+                res = sb.table("recommendations")                         .select("id,composite_score,score_label")                         .in_("id", chunk).execute()
+                if res.data:
+                    rc_data.extend(res.data)
+            except Exception:
+                pass
+        if rc_data:
+            rc_df = pd.DataFrame(rc_data)
             rc_df["id"] = rc_df["id"].astype(str)
             closed_port["recommendation_id"] = closed_port["recommendation_id"].astype(str)
             merged = closed_port.merge(rc_df, left_on="recommendation_id", right_on="id", how="inner")
