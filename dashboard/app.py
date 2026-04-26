@@ -1029,15 +1029,30 @@ elif page == "🔬 Backtest Lab":
     st.caption("Walk-forward simulation: did our signals actually work in live markets?")
 
     sim_meta = load_sim_meta()
-    if sim_meta:
-        sm1, sm2, sm3, sm4 = st.columns(4)
-        sm1.metric("Last Run",         str(sim_meta.get("last_run", "Never")))
-        sm2.metric("Total Simulated",  safe_int(sim_meta.get("total_simulated", 0)))
-        sm3.metric("Actual Win Rate",  f"{safe_float(sim_meta.get('actual_win_rate',0)):.1f}%")
-        sm4.metric("Actual Avg Return",f"{safe_float(sim_meta.get('actual_avg_return',0)):+.2f}%")
-    else:
+
+    # Always load all-time sims for the summary row (not filtered by days_back slider)
+    sims_all = load_simulations(days_back=365)
+
+    if sims_all.empty and not sim_meta:
         st.info("No simulations yet. The backsimulator runs weekly (Sunday) or trigger from GitHub Actions.")
         st.stop()
+
+    # Summary cards — compute live from DB, not from potentially stale sim_meta row
+    sm1, sm2, sm3, sm4 = st.columns(4)
+    last_run = str(sim_meta.get("last_run", "Never")) if sim_meta else "Never"
+    sm1.metric("Last Run", last_run)
+    if not sims_all.empty:
+        all_wins = (sims_all.was_win == True).sum()
+        all_total = len(sims_all)
+        all_wr    = all_wins / all_total * 100 if all_total > 0 else 0
+        all_avg   = float(sims_all.actual_return_pct.mean())
+        sm2.metric("Total Simulated",   all_total)
+        sm3.metric("Actual Win Rate",   f"{all_wr:.1f}%")
+        sm4.metric("Actual Avg Return", f"{all_avg:+.2f}%")
+    else:
+        sm2.metric("Total Simulated",   0)
+        sm3.metric("Actual Win Rate",   "—")
+        sm4.metric("Actual Avg Return", "—")
 
     days_back = st.slider("Look back N days", 30, 365, 90, key="sim_days")
     sims = load_simulations(days_back)
@@ -1096,15 +1111,30 @@ elif page == "🔬 Backtest Lab":
     st.subheader("📈 Composite Score vs Actual Return %")
     st.caption("Does a higher signal score actually predict better outcomes?")
     if "composite_score" in sims.columns and sims.composite_score.notna().any():
+        sims_plot = sims.dropna(subset=["composite_score","actual_return_pct"]).copy()
         fig_scatter = px.scatter(
-            sims.dropna(subset=["composite_score","actual_return_pct"]),
+            sims_plot,
             x="composite_score", y="actual_return_pct",
             color="actual_return_pct", color_continuous_scale="RdYlGn",
             hover_data=["ticker","signal_date","exit_reason","days_held"],
-            trendline="ols",
             title="Signal Composite Score vs Realised Return",
         )
         fig_scatter.add_hline(y=0, line_dash="dash", line_color="gray")
+        # Manual trendline using numpy (no statsmodels dependency)
+        if len(sims_plot) >= 3:
+            x_vals = sims_plot["composite_score"].values
+            y_vals = sims_plot["actual_return_pct"].values
+            try:
+                m, b   = np.polyfit(x_vals, y_vals, 1)
+                x_line = np.linspace(x_vals.min(), x_vals.max(), 50)
+                fig_scatter.add_trace(go.Scatter(
+                    x=x_line, y=m * x_line + b,
+                    mode="lines", name="Trend",
+                    line=dict(color="#60a5fa", width=2, dash="dot"),
+                    showlegend=True,
+                ))
+            except Exception:
+                pass
         fig_scatter.update_layout(height=380,
                                    plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
         st.plotly_chart(fig_scatter, use_container_width=True)
