@@ -77,3 +77,4 @@ def send_optimizer_summary(champion: dict, challenger: dict, best_score: float):
         f"⚔️ Challenger: v{challenger.get('version','?')} (score={best_score:.4f})\n"
         f"{verdict}"
     )
+ 
