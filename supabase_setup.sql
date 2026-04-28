@@ -296,16 +296,34 @@ ALTER TABLE simulation_meta ADD COLUMN IF NOT EXISTS benchmark_outperformance_ra
 ALTER TABLE agent_meta ADD COLUMN IF NOT EXISTS total_exits INT DEFAULT 0;
 ALTER TABLE agent_meta ADD COLUMN IF NOT EXISTS breadth_exits INT DEFAULT 0;
 
+-- 2026-04-28: surface whether the published target was lifted to satisfy
+-- MIN_RR_RATIO. Renders a "min R:R floor applied" badge in the dashboard.
+ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS rr_floor_applied BOOLEAN DEFAULT FALSE;
 
--- 2026-04-26: add dynamic R:R guard params to existing champion/challenger JSON
--- These are JSON parameters, not table columns. They prevent BUY recommendations
--- from showing stop downside larger than target upside.
-UPDATE agent_params
-SET params_json = jsonb_set(COALESCE(params_json, '{}'::jsonb), '{MIN_RR_RATIO}', '1.5'::jsonb, true)
-WHERE status IN ('champion', 'challenger')
-  AND NOT (COALESCE(params_json, '{}'::jsonb) ? 'MIN_RR_RATIO');
 
+-- 2026-04-26: safely add/update runtime params in existing champion/challenger JSON.
+-- This block is safe even if params_json accidentally contains a scalar JSON value
+-- instead of an object, which otherwise causes: ERROR 22023 cannot set path in scalar.
 UPDATE agent_params
-SET params_json = jsonb_set(COALESCE(params_json, '{}'::jsonb), '{MAX_RISK_PCT}', '8.0'::jsonb, true)
-WHERE status IN ('champion', 'challenger')
-  AND NOT (COALESCE(params_json, '{}'::jsonb) ? 'MAX_RISK_PCT');
+SET params_json =
+    jsonb_set(
+        jsonb_set(
+            jsonb_set(
+                CASE
+                    WHEN params_json IS NULL OR jsonb_typeof(params_json) <> 'object'
+                    THEN '{}'::jsonb
+                    ELSE params_json
+                END,
+                '{MIN_RR_RATIO}',
+                '1.5'::jsonb,
+                true
+            ),
+            '{MAX_RISK_PCT}',
+            '8.0'::jsonb,
+            true
+        ),
+        '{MIN_WEIGHTED_SCORE}',
+        '0.30'::jsonb,
+        true
+    )
+WHERE status IN ('champion', 'challenger');
