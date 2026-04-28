@@ -358,11 +358,19 @@ def dynamic_trade_levels(df: pd.DataFrame, signal_idx: int, entry_price: float, 
     resistance = _finite_float(resist_s.iloc[signal_idx] if signal_idx < len(resist_s) else None)
     atr_now = _finite_float(atr_s.iloc[signal_idx] if signal_idx < len(atr_s) else None)
 
+    rr_floor_applied = False
+
     if atr_now is None or atr_now <= 0:
-        # Last-resort fallback keeps the app functional on thin data, but the
-        # normal path above is support/resistance + ATR driven.
-        sl = entry_price * (1 - float(p.get("BT_SL_PCT", 5.0)) / 100)
-        tgt = entry_price * (1 + float(p.get("BT_TARGET_PCT", 10.0)) / 100)
+        # Last-resort fallback when ATR is unavailable. We still apply the
+        # MIN_RR_RATIO floor so the published BUY plan can never have its
+        # target sitting closer to entry than its stop — that would publish a
+        # negative-expectancy setup regardless of the technical score.
+        sl_pct_p = float(p.get("BT_SL_PCT", 5.0))
+        tgt_pct_p = float(p.get("BT_TARGET_PCT", 10.0))
+        # Cap risk by configured max_risk_pct as well — same envelope as main path.
+        sl_pct_p = min(sl_pct_p, max_risk_pct)
+        sl  = entry_price * (1 - sl_pct_p  / 100.0)
+        tgt = entry_price * (1 + tgt_pct_p / 100.0)
     else:
         fallback_sl = entry_price - 1.25 * atr_now
         fallback_tgt = entry_price + 1.75 * atr_now
@@ -391,30 +399,43 @@ def dynamic_trade_levels(df: pd.DataFrame, signal_idx: int, entry_price: float, 
         if tgt <= entry_price:
             tgt = fallback_tgt
 
-        # If the nearest resistance gives less upside than the stop risk, do
-        # not publish an unattractive BUY plan. Keep the stop dynamic, then
-        # project the target to the minimum acceptable reward/risk threshold.
-        # This is a floor, not a fixed 2:1 template: stronger resistance/ATR
-        # targets can still produce higher R:R naturally.
-        actual_risk = entry_price - sl
-        if actual_risk > 0 and min_rr_ratio > 0:
-            min_tgt = entry_price + actual_risk * min_rr_ratio
-            if tgt < min_tgt:
-                tgt = min_tgt
+    # ── Universal MIN_RR_RATIO floor ─────────────────────────────────────
+    # Applies in BOTH paths above. If natural target < entry + risk × min_rr,
+    # raise target so reward ≥ min_rr × risk. This is a floor, not a fixed
+    # template — stronger resistance/ATR targets keep their natural R:R.
+    actual_risk = entry_price - sl
+    if actual_risk > 0 and min_rr_ratio > 0:
+        min_tgt = entry_price + actual_risk * min_rr_ratio
+        if tgt < min_tgt:
+            tgt = min_tgt
+            rr_floor_applied = True
 
-    risk_pct = (entry_price - sl) / entry_price * 100 if sl and sl < entry_price else None
-    reward_pct = (tgt - entry_price) / entry_price * 100 if tgt and tgt > entry_price else None
-    rr_ratio = (reward_pct / risk_pct) if risk_pct and risk_pct > 0 and reward_pct is not None else None
+    # Final sanity guard: target must strictly exceed entry, which must
+    # strictly exceed stop. If not, signal is invalid.
+    if not (sl is not None and tgt is not None and sl < entry_price < tgt):
+        return sanitize_for_json({
+            "stop_loss": None, "target": None,
+            "risk_pct": None, "reward_pct": None, "rr_ratio": None,
+            "support": round(support, 2) if support is not None else None,
+            "resistance": round(resistance, 2) if resistance is not None else None,
+            "atr": round(atr_now, 2) if atr_now is not None else None,
+            "rr_floor_applied": False,
+        })
+
+    risk_pct = (entry_price - sl) / entry_price * 100
+    reward_pct = (tgt - entry_price) / entry_price * 100
+    rr_ratio = reward_pct / risk_pct if risk_pct > 0 else None
 
     return sanitize_for_json({
-        "stop_loss": round(sl, 2) if sl else None,
-        "target": round(tgt, 2) if tgt else None,
-        "risk_pct": round(risk_pct, 2) if risk_pct is not None else None,
-        "reward_pct": round(reward_pct, 2) if reward_pct is not None else None,
+        "stop_loss": round(sl, 2),
+        "target": round(tgt, 2),
+        "risk_pct": round(risk_pct, 2),
+        "reward_pct": round(reward_pct, 2),
         "rr_ratio": round(rr_ratio, 2) if rr_ratio is not None else None,
         "support": round(support, 2) if support is not None else None,
         "resistance": round(resistance, 2) if resistance is not None else None,
         "atr": round(atr_now, 2) if atr_now is not None else None,
+        "rr_floor_applied": rr_floor_applied,
     })
 
 
@@ -887,13 +908,15 @@ def fetch_news_sentiment(ticker: str, company_name: str, hf_token: str) -> dict:
     }
 
 
-def get_signal_streaks(today: str) -> dict[str, int]:
+def get_signal_streaks(today: str) -> dict[str, tuple[str, int]]:
     """
-    Query the last 12 days of recommendations (excluding today).
-    Returns {ticker: consecutive_day_count_before_today}.
-    A ticker that had a BUY yesterday and the day before returns 2.
+    Query the last 14 days of recommendations (excluding today).
+    Returns {ticker: (last_action, consecutive_day_count_before_today)}.
+    Returning the action lets the caller correctly flip the streak when today's
+    action differs from yesterday's (a BUY today after a 3-day EXIT streak is
+    a fresh 1-day BUY, not a 4-day streak).
     """
-    streaks: dict[str, int] = {}
+    streaks: dict[str, tuple[str, int]] = {}
     try:
         start = (datetime.today() - timedelta(days=14)).strftime("%Y-%m-%d")
         res   = (
@@ -924,7 +947,7 @@ def get_signal_streaks(today: str) -> dict[str, int]:
                     streak += 1
                 else:
                     break
-            streaks[ticker] = streak
+            streaks[ticker] = (last_action, streak)
 
     except Exception as e:
         print(f"\n  ⚠️  Signal streak fetch failed: {e}")
@@ -973,6 +996,14 @@ def _build_telegram_message(records: list[dict], regime: str,
     regime_e = {"BULLISH": "🟢", "BEARISH": "🔴", "NEUTRAL": "🟡"}.get(regime, "⬜")
     news_e   = {"POSITIVE": "🟢", "NEGATIVE": "🔴", "NEUTRAL": "🟡"}
 
+    def esc(s: str) -> str:
+        # Telegram's HTML parse_mode rejects bare `&`. Tickers like M&M would
+        # otherwise break the entire message. Order matters — replace & first.
+        return (str(s or "")
+                .replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;"))
+
     lines = [
         f"🇮🇳 <b>Indian Stock Agent — {today}</b>",
         f"Market Regime  : {regime_e} {regime}",
@@ -999,38 +1030,42 @@ def _build_telegram_message(records: list[dict], regime: str,
             sl    = float(r.get("stop_loss") or 0)
             tgt   = float(r.get("target") or 0)
 
-            sl_pct  = ((sl - price) / price * 100) if price else 0
-            tgt_pct = ((tgt - price) / price * 100) if price else 00
-          
+            sl_pct  = ((sl - price) / price * 100) if price > 0 and sl > 0 else 0.0
+            tgt_pct = ((tgt - price) / price * 100) if price > 0 and tgt > 0 else 0.0
+
+            active_str = r.get("active_strategies") or ""
             lines.append(
-                f"\n{idx}. <b>{r['ticker']}</b>{streak_str} — "
-                f"{r.get('composite_score', 0):.0f}/100 ({r.get('score_label','')})"
+                f"\n{idx}. <b>{esc(r['ticker'])}</b>{streak_str} — "
+                f"{r.get('composite_score', 0):.0f}/100 ({esc(r.get('score_label',''))})"
             )
             lines.append(
                 f"   ₹{price:,.2f} | "
                 f"SL ₹{sl:,.2f} ({sl_pct:+.2f}%) | "
                 f"Target ₹{tgt:,.2f} ({tgt_pct:+.2f}%)"
             )
-          
-            lines.append(f"   {r.get('active_strategies', '')}")
+
+            if active_str:
+                lines.append(f"   {esc(active_str)}")
             if ne:
                 headline = r.get("news_headline") or ""
                 short_hl = (headline[:75] + "…") if len(headline) > 75 else headline
-                lines.append(f"   News: {ne} {ns}{flag}")
+                lines.append(f"   News: {ne} {esc(ns)}{flag}")
                 if short_hl:
-                    lines.append(f"   📰 {short_hl}")
+                    lines.append(f"   📰 {esc(short_hl)}")
             fund_flag = r.get("fundamental_flag") or ""
             if fund_flag and fund_flag not in ("OK", "DATA_UNAVAILABLE", ""):
-                lines.append(f"   ⚠️ Fundamentals: {fund_flag}")
+                lines.append(f"   ⚠️ Fundamentals: {esc(fund_flag)}")
 
     if exits:
         lines.append("\n🔴 <b>EXIT / AVOID-NEW-LONG SIGNALS</b>")
         for idx, r in enumerate(exits, 1):
             lines.append(
-                f"\n{idx}. <b>{r['ticker']}</b> — "
-                f"{r.get('composite_score', 0):.0f}/100 | ₹{r.get('price', 0):,.2f}"
+                f"\n{idx}. <b>{esc(r['ticker'])}</b> — "
+                f"{r.get('composite_score', 0):.0f}/100 | ₹{r.get('price', 0) or 0:,.2f}"
             )
-            lines.append(f"   {r.get('active_strategies', '')}")
+            active_str = r.get("active_strategies") or ""
+            if active_str:
+                lines.append(f"   {esc(active_str)}")
             lines.append("   Not a short-sell recommendation.")
 
     lines.append(f"\n📊 {len(records)} total signals | {today}")
@@ -1101,11 +1136,16 @@ def composite_score(today_sigs: dict, bt_results: dict, ctx: dict,
 
     rr = ctx.get("rr_ratio")
     rr = _finite_float(rr, 0.0) or 0.0
+    # The "good R:R" anchor for BUY scoring (3.0) and the EXIT penalty cutoff
+    # are derived from MIN_RR_RATIO so re-tuning the floor stays consistent.
+    min_rr = float(p.get("MIN_RR_RATIO", 1.5))
+    rr_good = max(min_rr * 2.0, 3.0)            # full BUY R:R points at this R:R
+    rr_exit_cap = max(min_rr * 1.33, 2.0)        # above this, EXIT R:R penalty is 0
     if action == "BUY":
-        rr_pts = min(rr / 3.0 * p["W_RR"], p["W_RR"])
+        rr_pts = max(0.0, min(rr / rr_good * p["W_RR"], p["W_RR"]))
     else:
         # For EXIT, a poor long-side R:R strengthens the avoid-new-long signal.
-        rr_pts = max(0.0, min((2.0 - rr) / 2.0 * p["W_RR"], p["W_RR"]))
+        rr_pts = max(0.0, min((rr_exit_cap - rr) / rr_exit_cap * p["W_RR"], p["W_RR"]))
 
     reg_pts = (regime_sc * p["W_REGIME"]
                if action == "BUY"
@@ -1223,6 +1263,7 @@ def context(df: pd.DataFrame, p: dict) -> dict:
         risk_pct   = levels.get("risk_pct"),
         reward_pct = levels.get("reward_pct"),
         rr_ratio   = levels.get("rr_ratio"),
+        rr_floor_applied = bool(levels.get("rr_floor_applied", False)),
         volume     = int(df.Volume.iloc[-1]) if pd.notna(df.Volume.iloc[-1]) else 0,
         avg_volume = int(vol20) if pd.notna(vol20) and math.isfinite(float(vol20)) else 0,
     )
@@ -1236,6 +1277,10 @@ def market_regime(p: dict) -> tuple[str, float]:
     try:
         df = yf.download("^NSEI", period="120d", progress=False, auto_adjust=True)
         if df.empty or len(df) < 55:
+            return "UNKNOWN", 0.5
+        # yfinance can return MultiIndex columns; flatten defensively.
+        df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+        if "Close" not in df.columns:
             return "UNKNOWN", 0.5
         close = df["Close"].squeeze()
         e50   = float(ema(close, 50).iloc[-1])
@@ -1254,7 +1299,7 @@ def market_regime(p: dict) -> tuple[str, float]:
 
 def run():
     today = datetime.today().strftime("%Y-%m-%d")
-    print(f"\n🇮🇳 Indian Stock Agent v5 — {today}")
+    print(f"\n🇮🇳 Indian Stock Agent v6 — {today}")
 
     # ── Credentials
     P, param_version = load_active_params()
@@ -1263,7 +1308,10 @@ def run():
     tg_chat   = os.environ.get("TELEGRAM_CHAT_ID", "")
 
     if not hf_token:
-        print("  ℹ️  HF_TOKEN not set — news sentiment will be skipped")
+        if _VADER_OK:
+            print("  ℹ️  HF_TOKEN not set — news sentiment will use VADER fallback")
+        else:
+            print("  ℹ️  HF_TOKEN not set and vaderSentiment unavailable — news disabled")
     if not tg_token:
         print("  ℹ️  TELEGRAM_BOT_TOKEN not set — Telegram alerts disabled")
     if not _GNEWS_OK:
@@ -1329,8 +1377,12 @@ def run():
             fund = fetch_fundamentals(ticker)
             company_name = fund.get("company_name") or NSE_COMPANY_NAMES.get(ticker, ticker)
 
-            # ── News sentiment (only if score is interesting enough and HF token present)
-            if technical_score >= 25 and hf_token:
+            # ── News sentiment (gate on score + at least one available backend)
+            # Previously only ran when HF_TOKEN was set, which silently disabled
+            # VADER even when it was installed. Now: run if EITHER FinBERT
+            # (HF token) OR VADER is available, and gnews can fetch headlines.
+            news_backend_ok = _GNEWS_OK and (bool(hf_token) or _VADER_OK)
+            if technical_score >= 25 and news_backend_ok:
                 news = fetch_news_sentiment(ticker, company_name, hf_token)
                 # news_alert: technical signal contradicts news sentiment
                 news["news_alert"] = (
@@ -1345,6 +1397,7 @@ def run():
                     "news_headlines": [],
                     "news_count": 0,
                     "news_multiplier": 1.0,
+                    "news_source": "disabled",
                     "news_alert": False,
                 }
 
@@ -1360,8 +1413,9 @@ def run():
             })
 
             # ── Signal streak (previous days + today = total)
-            prev_streak  = streaks.get(ticker, 0)
-            streak_today = prev_streak + 1
+            # Reset to 1 if today's action flips relative to the previous streak.
+            prev_action, prev_streak = streaks.get(ticker, (None, 0))
+            streak_today = (prev_streak + 1) if prev_action == action else 1
 
             # ── Aggregate backtest for active BUY strategies only. EXIT signals are
             # not short trades, so win-rate/profit-factor are intentionally blank.
