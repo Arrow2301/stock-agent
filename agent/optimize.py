@@ -59,7 +59,7 @@ SAMPLE_STOCKS = [
     "SUNPHARMA", "DRREDDY", "CIPLA", "DIVISLAB", "APOLLOHOSP",
 
     # Auto / Auto Ancillaries
-    "MARUTI", "M&M", "TATAMOTORS", "EICHERMOT", "HEROMOTOCO",
+    "MARUTI", "M&M", "TMPV", "EICHERMOT", "HEROMOTOCO",
     "TVSMOTOR",
 
     # Energy / Utilities
@@ -188,20 +188,28 @@ def _dynamic_levels(df, signal_idx, entry_price, p):
     support = _finite_float(support_s.iloc[signal_idx] if signal_idx < len(support_s) else None)
     resistance = _finite_float(resist_s.iloc[signal_idx] if signal_idx < len(resist_s) else None)
     atr_now = _finite_float(atr_s.iloc[signal_idx] if signal_idx < len(atr_s) else None)
-    if atr_now is None or atr_now <= 0:
-        return entry_price * (1 - p["BT_SL_PCT"] / 100), entry_price * (1 + p["BT_TARGET_PCT"] / 100)
     stop_buf = float(p.get("ATR_STOP_BUFFER", 0.50))
     target_buf = float(p.get("ATR_TARGET_BUFFER", 0.50))
     max_risk_atr = float(p.get("MAX_RISK_ATR", 3.00))
     max_risk_pct = float(p.get("MAX_RISK_PCT", 8.00))
     min_rr_ratio = float(p.get("MIN_RR_RATIO", 1.50))
-    sl = (support - stop_buf * atr_now) if support is not None and support < entry_price else entry_price - 1.25 * atr_now
-    sl = max(sl, entry_price - max_risk_atr * atr_now, entry_price * (1 - max_risk_pct / 100.0))
-    if sl >= entry_price:
-        sl = max(entry_price - 1.25 * atr_now, entry_price * (1 - max_risk_pct / 100.0))
-    tgt = (resistance + target_buf * atr_now) if resistance is not None and resistance > entry_price else entry_price + 1.75 * atr_now
-    if tgt <= entry_price:
-        tgt = entry_price + 1.75 * atr_now
+
+    if atr_now is None or atr_now <= 0:
+        # ATR fallback: same risk envelope and R:R floor as the live agent.
+        sl_pct_p  = min(float(p["BT_SL_PCT"]), max_risk_pct)
+        tgt_pct_p = float(p["BT_TARGET_PCT"])
+        sl  = entry_price * (1 - sl_pct_p  / 100.0)
+        tgt = entry_price * (1 + tgt_pct_p / 100.0)
+    else:
+        sl = (support - stop_buf * atr_now) if support is not None and support < entry_price else entry_price - 1.25 * atr_now
+        sl = max(sl, entry_price - max_risk_atr * atr_now, entry_price * (1 - max_risk_pct / 100.0))
+        if sl >= entry_price:
+            sl = max(entry_price - 1.25 * atr_now, entry_price * (1 - max_risk_pct / 100.0))
+        tgt = (resistance + target_buf * atr_now) if resistance is not None and resistance > entry_price else entry_price + 1.75 * atr_now
+        if tgt <= entry_price:
+            tgt = entry_price + 1.75 * atr_now
+
+    # Universal R:R floor — applies regardless of which path produced sl/tgt.
     actual_risk = entry_price - sl
     if actual_risk > 0 and min_rr_ratio > 0:
         tgt = max(tgt, entry_price + actual_risk * min_rr_ratio)
@@ -370,7 +378,7 @@ def make_objective(all_data):
             "EMA_SHORT":          ema_short,
             "EMA_LONG":           ema_long,
             "RSI_PERIOD":         trial.suggest_int(  "RSI_PERIOD",    7,  21),
-            "RSI_OVERSOLD":       trial.suggest_int(  "RSI_OVERSOLD", 25,  45),
+            "RSI_OVERSOLD":       trial.suggest_int(  "RSI_OVERSOLD", 25,  50),
             "RSI_OVERBOUGHT":     trial.suggest_int(  "RSI_OVERBOUGHT",55, 78),
             "MACD_FAST":          trial.suggest_int(  "MACD_FAST",     8,  16),
             "MACD_SLOW":          trial.suggest_int(  "MACD_SLOW",    20,  35),
@@ -382,7 +390,7 @@ def make_objective(all_data):
             "BT_SL_PCT":          trial.suggest_float("BT_SL_PCT",    2.0,  8.0),
             "BT_TARGET_PCT":      trial.suggest_float("BT_TARGET_PCT", 4.0, 18.0),
             "BT_MAX_HOLD":        trial.suggest_int(  "BT_MAX_HOLD",   3,  25),
-            "MIN_WEIGHTED_SCORE": trial.suggest_float("MIN_WEIGHTED_SCORE",0.10,0.55),
+            "MIN_WEIGHTED_SCORE": trial.suggest_float("MIN_WEIGHTED_SCORE",0.05,0.55),
             "RR_LOOKBACK":        trial.suggest_int(  "RR_LOOKBACK", 14, 35),
             "ATR_STOP_BUFFER":    trial.suggest_float("ATR_STOP_BUFFER", 0.25, 1.00),
             "ATR_TARGET_BUFFER":  trial.suggest_float("ATR_TARGET_BUFFER", 0.25, 1.25),
@@ -537,18 +545,20 @@ def run():
 
     objective_fn = make_objective(all_data)
 
-    # Warm-start: add the default params as a first trial
+    # Warm-start the search with the live agent's DEFAULT_PARAMS so the first
+    # trial is the configuration users would see if they ran today without an
+    # active champion. Values are kept inside the suggest_* ranges above.
     default_params_for_optuna = {
         "EMA_SHORT": 9, "EMA_LONG": 21,
-        "RSI_PERIOD": 14, "RSI_OVERSOLD": 42, "RSI_OVERBOUGHT": 62,
+        "RSI_PERIOD": 14, "RSI_OVERSOLD": 48, "RSI_OVERBOUGHT": 58,
         "MACD_FAST": 12, "MACD_SLOW": 26, "MACD_SIGNAL": 9,
         "BB_PERIOD": 20, "BB_STD": 2.0,
         "ATR_PERIOD": 14, "SUPERTREND_MULT": 3.0,
         "BT_SL_PCT": 5.0, "BT_TARGET_PCT": 10.0, "BT_MAX_HOLD": 15,
-        "MIN_WEIGHTED_SCORE": 0.28,
+        "MIN_WEIGHTED_SCORE": 0.08,
         "RR_LOOKBACK": 20, "ATR_STOP_BUFFER": 0.50, "ATR_TARGET_BUFFER": 0.50,
         "MAX_RISK_ATR": 3.00, "MAX_RISK_PCT": 8.00, "MIN_RR_RATIO": 1.50,
-        "DONCHIAN_PERIOD": 20, "VOLUME_MULT": 1.5, "RSI_MIDLINE": 50,
+        "DONCHIAN_PERIOD": 20, "VOLUME_MULT": 1.2, "RSI_MIDLINE": 50,
         "W_RSI": 20, "W_VOLUME": 15, "W_RR": 15, "W_REGIME": 10,
     }
     study.enqueue_trial(default_params_for_optuna)
