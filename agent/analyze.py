@@ -1,25 +1,39 @@
 #!/usr/bin/env python3
 """
 ============================================================
-  Indian Stock Market Analysis Agent  —  v5
-  Runs daily via GitHub Actions at 7:00 AM IST
+  Indian Stock Market Analysis Agent  —  v7
+  Runs daily via GitHub Actions (skips on NSE holidays)
 
-  New in v5:
-  ─ Fundamental screening data (P/E, D/E, revenue growth)
-    fetched via yfinance for every signal that passes the
-    weighted-vote filter. Stored for display; not a hard filter.
-  ─ News sentiment via gnews + FinBERT (HuggingFace Inference API).
-    Fetched only for signals with composite_score >= 25.
-    Requires HF_TOKEN GitHub Secret (free tier, optional).
-    Adds: news_score, news_sentiment, news_headline, news_alert.
-  ─ Signal streak: consecutive days the same ticker fired the
-    same action. Loaded in one DB query before the main loop.
-  ─ Market breadth: buy/sell signal ratio, saved to agent_meta.
-  ─ Telegram morning alert via Bot API after each run.
-    Requires TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID Secrets (optional).
-  ─ All 6 strategies active in get_strategies().
-  ─ trade_returns list stored in each strategy's backtest JSON
-    so the dashboard histogram works.
+  Changes from v6 → v7
+  ────────────────────
+  Data-driven cleanup based on analysis of 932 recommendations
+  and 239 backsimulated outcomes:
+
+  ─ Strategy roster reduced 6 → 4. Removed:
+      * RSI + MACD     — fired 0 times in 932 recs
+      * Volume Breakout — Donchian-alone WR 69.4% drops to
+        58.6% when paired with VB; the "confirmation"
+        actively destroys edge.
+  ─ Supertrend computation removed entirely. It was never in
+    the strategy list, only displayed; pure overhead.
+  ─ Hard gate: BUY signals require exactly one strategy
+    firing. Multi-strategy signals win 65% vs single 71%.
+  ─ Hard gate: BEARISH regime vetoes all new longs (was a
+    soft -10pt nudge that wasn't enough).
+  ─ News sentiment moved to news_v2.py — junk-headline filter
+    + financial-keyword overrides for "profit booking",
+    "downgrade to sell", etc. that VADER mis-classifies.
+  ─ Optional: momentum_vs_nifty_30d feature recorded for use
+    in Phase 2 LR scoring model.
+  ─ Holiday-aware: workflow now skips on NSE holidays.
+
+  Carried over from v6
+  ────────────────────
+  ─ Fundamental screening (P/E, D/E, ROE, revenue growth)
+  ─ Signal streak tracking
+  ─ Market breadth metric in agent_meta
+  ─ Telegram morning alert
+  ─ trade_returns list in backtest JSON for dashboard
 ============================================================
 """
 
@@ -28,7 +42,6 @@ import sys
 import time
 import json
 import math
-import re
 import warnings
 from datetime import datetime, timedelta
 
@@ -38,17 +51,9 @@ import pandas as pd
 import numpy as np
 from supabase import create_client, Client
 
-try:
-    from gnews import GNews
-    _GNEWS_OK = True
-except ImportError:
-    _GNEWS_OK = False
-
-try:
-    from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-    _VADER_OK = True
-except ImportError:
-    _VADER_OK = False
+# News scoring lives in agent/news_v2.py (junk filter + financial overrides).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from news_v2 import fetch_news_sentiment   # noqa: E402
 
 warnings.filterwarnings("ignore")
 
@@ -110,7 +115,7 @@ DEFAULT_PARAMS = {
     "DONCHIAN_PERIOD":    20,
     "VOLUME_MULT":        1.2,
     "ATR_PERIOD":         14,
-    "SUPERTREND_MULT":    3.0,
+    # SUPERTREND_MULT removed in v7 — Supertrend was never a strategy, only displayed.
     "BT_SL_PCT":          5.0,   # fallback only if ATR/S-R levels are unavailable
     "BT_TARGET_PCT":      10.0,  # fallback only if ATR/S-R levels are unavailable
     "BT_MAX_HOLD":        15,
@@ -235,20 +240,11 @@ def atr(h, l, c, p):
     tr = pd.concat([(h - l), (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
     return tr.ewm(alpha=1 / p, min_periods=p, adjust=False).mean()
 
-def supertrend(h, l, c, p, mult):
-    atr_v = atr(h, l, c, p)
-    hl2   = (h + l) / 2
-    up    = hl2 + mult * atr_v
-    dn    = hl2 - mult * atr_v
-    trend = pd.Series(1, index=c.index)
-    fu, fl = up.copy(), dn.copy()
-    for i in range(1, len(c)):
-        fu.iloc[i] = up.iloc[i] if (up.iloc[i] < fu.iloc[i - 1] or c.iloc[i - 1] > fu.iloc[i - 1]) else fu.iloc[i - 1]
-        fl.iloc[i] = dn.iloc[i] if (dn.iloc[i] > fl.iloc[i - 1] or c.iloc[i - 1] < fl.iloc[i - 1]) else fl.iloc[i - 1]
-        if   trend.iloc[i - 1] == -1 and c.iloc[i] > fu.iloc[i]: trend.iloc[i] =  1
-        elif trend.iloc[i - 1] ==  1 and c.iloc[i] < fl.iloc[i]: trend.iloc[i] = -1
-        else:                                                       trend.iloc[i] = trend.iloc[i - 1]
-    return trend, pd.Series(np.where(trend == 1, fl, fu), index=c.index)
+# v7: Supertrend computation removed. It was never in get_strategies(),
+# only computed in context() for display. Pure overhead, anti-predictive
+# at best. Indicator and the supertrend_up / supertrend_line fields are
+# both gone. Dashboard tolerates NULLs in these legacy columns for
+# pre-v7 rows.
 
 # ─────────────────────────────────────────────
 #  SIGNAL GENERATORS
@@ -262,13 +258,9 @@ def sig_ema(df, p):
     s[(e_s < e_l) & (e_s.shift() >= e_l.shift())] = -1
     return s
 
-def sig_rsi_macd(df, p):
-    r       = rsi(df.Close, p["RSI_PERIOD"])
-    _, _, h = macd(df.Close, p["MACD_FAST"], p["MACD_SLOW"], p["MACD_SIGNAL"])
-    s       = pd.Series(0, index=df.index)
-    s[(r < p["RSI_OVERSOLD"])   & (h > 0) & (h.shift() <= 0)] =  1
-    s[(r > p["RSI_OVERBOUGHT"]) & (h < 0) & (h.shift() >= 0)] = -1
-    return s
+# v7: sig_rsi_macd removed — fired 0 times in 932 production
+# recommendations. The joint condition (RSI<48 AND MACD histogram
+# crossing positive zero) is essentially never simultaneously true.
 
 def sig_bb(df, p):
     up, _, lo = bollinger(df.Close, p["BB_PERIOD"], p["BB_STD"])
@@ -287,16 +279,10 @@ def sig_donchian(df, p):
     s[(df.Close < ll.shift(1)) & (df.Close.shift(1) >= ll.shift(1))] = -1
     return s
 
-def sig_volume_breakout(df, p):
-    period   = int(p.get("DONCHIAN_PERIOD", 20))
-    vol_mult = float(p.get("VOLUME_MULT", 1.5))
-    hh       = df.High.rolling(period).max()
-    ll       = df.Low.rolling(period).min()
-    avg_vol  = df.Volume.rolling(20).mean()
-    s        = pd.Series(0, index=df.index)
-    s[(df.Close > hh.shift(1)) & (df.Close.shift(1) <= hh.shift(1)) & (df.Volume > avg_vol * vol_mult)] =  1
-    s[(df.Close < ll.shift(1)) & (df.Close.shift(1) >= ll.shift(1)) & (df.Volume > avg_vol * vol_mult)] = -1
-    return s
+# v7: sig_volume_breakout removed — Donchian-alone WR was 69.4%,
+# Donchian + Volume Breakout dropped to 58.6%. The volume filter
+# was selecting climax/exhaustion volume rather than initiation
+# volume. Net effect: removed ~11pp of edge from confirmed signals.
 
 def sig_rsi_trend_shift(df, p):
     r   = rsi(df.Close, p["RSI_PERIOD"])
@@ -308,13 +294,16 @@ def sig_rsi_trend_shift(df, p):
     return s
 
 def get_strategies(p: dict) -> dict:
+    """v7 strategy roster — 4 strategies, evidence-based.
+    Removed in v7 based on production data:
+      * RSI + MACD       — fired 0 times in 932 recs
+      * Volume Breakout  — anti-predictive when paired with Donchian
+    """
     return {
-        "EMA Crossover":   lambda df: sig_ema(df, p),
-        "RSI + MACD":      lambda df: sig_rsi_macd(df, p),
-        "Bollinger":       lambda df: sig_bb(df, p),
-        "Donchian":        lambda df: sig_donchian(df, p),
-        "Volume Breakout": lambda df: sig_volume_breakout(df, p),
-        "RSI Trend Shift": lambda df: sig_rsi_trend_shift(df, p),
+        "Donchian":        lambda df: sig_donchian(df, p),         # primary, n=189 backsim, 67.7% WR
+        "EMA Crossover":   lambda df: sig_ema(df, p),              # secondary, n=53 backsim, 66.0% WR
+        "RSI Trend Shift": lambda df: sig_rsi_trend_shift(df, p),  # n=49, 63.3% WR — kept for diversity
+        "Bollinger":       lambda df: sig_bb(df, p),               # n=9 small sample, monitoring
     }
 
 # ─────────────────────────────────────────────
@@ -675,113 +664,13 @@ def fetch_fundamentals(ticker: str) -> dict:
         return _default
 
 # ─────────────────────────────────────────────
-#  NEWS SENTIMENT
-#  gnews  →  headlines  →  FinBERT (HF API)
-#  Only runs when HF_TOKEN env var is set.
+#  SCORE MULTIPLIERS
+#  News scoring lives in agent/news_v2.py.
+#  Fundamentals → multiplier kept here.
 # ─────────────────────────────────────────────
 
-def _normalize_news_text(text: str) -> str:
-    text = (text or "").lower()
-    text = re.sub(r"[^a-z0-9&+ ]+", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
-
-
-def _company_aliases(ticker: str, company_name: str) -> list[str]:
-    raw = [ticker or "", company_name or ""]
-    cleaned = company_name or ""
-    for suffix in [" Limited", " Ltd", " Ltd.", " Corporation", " Corp", " Company"]:
-        if cleaned.endswith(suffix):
-            raw.append(cleaned[: -len(suffix)])
-
-    aliases: list[str] = []
-    seen: set[str] = set()
-    for item in raw:
-        norm = _normalize_news_text(item.replace("NSE:", "").replace("BSE:", ""))
-        if norm and len(norm) >= 3 and norm not in seen:
-            aliases.append(norm)
-            seen.add(norm)
-        compact = norm.replace(" ", "")
-        if compact and len(compact) >= 4 and compact not in seen:
-            aliases.append(compact)
-            seen.add(compact)
-    return aliases
-
-
-def _headline_is_relevant(headline: str, ticker: str, company_name: str) -> bool:
-    norm = _normalize_news_text(headline)
-    if not norm:
-        return False
-    aliases = _company_aliases(ticker, company_name)
-    if not aliases:
-        return False
-    compact_norm = norm.replace(" ", "")
-    return any(alias in norm or alias.replace(" ", "") in compact_norm for alias in aliases)
-
-
-def _fetch_news_headlines(ticker: str, company_name: str, n: int = 5) -> list[str]:
-    """Fetch recent headlines via GNews and keep only clearly relevant ones."""
-    if not _GNEWS_OK:
-        return []
-
-    queries: list[str] = []
-    if company_name:
-        queries.extend([
-            f'"{company_name}" stock',
-            f'"{company_name}" share',
-            f'"{company_name}" news',
-        ])
-    queries.extend([
-        f'"{ticker}" NSE',
-        f'"{ticker}" stock',
-        f'"{ticker}" share',
-    ])
-
-    seen: set[str] = set()
-    kept: list[str] = []
-    try:
-        gn = GNews(language="en", country="IN", period="7d", max_results=max(8, n * 2))
-        for query in queries:
-            for row in gn.get_news(query) or []:
-                headline = (row.get("title") or "").strip()
-                if len(headline) <= 10:
-                    continue
-                key = headline.lower()
-                if key in seen:
-                    continue
-                seen.add(key)
-                if _headline_is_relevant(headline, ticker, company_name):
-                    kept.append(headline)
-                    if len(kept) >= n:
-                        return kept
-        return kept[:n]
-    except Exception:
-        return []
-
-
-def _label_from_score(score: float) -> str:
-    if score >= 0.12:
-        return "POSITIVE"
-    if score <= -0.12:
-        return "NEGATIVE"
-    return "NEUTRAL"
-
-
-def _news_multiplier_from_score(score: float) -> float:
-    # Controlled multiplier: news can nudge, not dominate, the technical model.
-    if score >= 0.35:
-        return 1.06
-    if score >= 0.12:
-        return 1.03
-    if score <= -0.35:
-        return 0.94
-    if score <= -0.12:
-        return 0.97
-    return 1.00
-
-
 def _fundamental_multiplier_from_score(score: float | None) -> float:
-    # Controlled multiplier: fundamentals remain secondary to technicals.
+    """Controlled multiplier: fundamentals are secondary to technicals."""
     fs = _finite_float(score, 50.0)
     if fs >= 80:
         return 1.06
@@ -794,118 +683,14 @@ def _fundamental_multiplier_from_score(score: float | None) -> float:
     return 1.00
 
 
-def apply_score_multipliers(technical_score: float, fundamental_score: float | None, news_multiplier: float | None) -> tuple[float, float, float]:
+def apply_score_multipliers(technical_score: float, fundamental_score: float | None,
+                            news_multiplier: float | None) -> tuple[float, float, float]:
+    """Apply fundamental + news multipliers to the technical score."""
     fund_mult = _fundamental_multiplier_from_score(fundamental_score)
     news_mult = _finite_float(news_multiplier, 1.0)
     final_mult = max(0.88, min(1.12, fund_mult * news_mult))
     final_score = max(0.0, min(100.0, float(technical_score or 0) * final_mult))
     return round(final_score, 1), round(final_mult, 3), round(fund_mult, 3)
-
-
-def _score_headline_with_finbert(headline: str, hf_token: str):
-    if not headline or not hf_token:
-        return None
-    headers = {
-        "Authorization": f"Bearer {hf_token}",
-        "Content-Type": "application/json",
-    }
-    for attempt in range(3):
-        try:
-            resp = requests.post(
-                HF_FINBERT_URL,
-                headers=headers,
-                json={"inputs": headline[:512]},
-                timeout=25,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                if isinstance(data, list) and data:
-                    scores_raw = data[0] if isinstance(data[0], list) else data
-                    sd = {
-                        str(item.get("label", "")).lower(): float(item.get("score", 0.0))
-                        for item in scores_raw
-                        if isinstance(item, dict)
-                    }
-                    pos = sd.get("positive", 0.0)
-                    neg = sd.get("negative", 0.0)
-                    net = pos - neg
-                    return round(net, 3), _label_from_score(net)
-            elif resp.status_code == 503 and attempt < 2:
-                try:
-                    wait = min(float(resp.json().get("estimated_time", 20)), 30)
-                except Exception:
-                    wait = 10
-                time.sleep(wait)
-                continue
-            else:
-                break
-        except requests.Timeout:
-            if attempt < 2:
-                time.sleep(5)
-                continue
-            break
-        except Exception:
-            break
-    return None
-
-
-def _score_headline_with_vader(headline: str):
-    if not headline or not _VADER_OK:
-        return None
-    try:
-        analyzer = SentimentIntensityAnalyzer()
-        compound = float(analyzer.polarity_scores(headline).get("compound", 0.0))
-        return round(compound, 3), _label_from_score(compound)
-    except Exception:
-        return None
-
-
-def fetch_news_sentiment(ticker: str, company_name: str, hf_token: str) -> dict:
-    """Fetch relevant headlines, score them one by one, and return display-ready fields."""
-    empty = {
-        "news_score": 0.0,
-        "news_sentiment": "NEUTRAL",
-        "news_headline": None,
-        "news_headlines": [],
-        "news_count": 0,
-        "news_multiplier": 1.0,
-        "news_alert": False,
-    }
-
-    headlines = _fetch_news_headlines(ticker, company_name)
-    if not headlines:
-        return empty
-
-    scored = []
-    finbert_used = False
-    for headline in headlines:
-        result = _score_headline_with_finbert(headline, hf_token) if hf_token else None
-        if result is not None:
-            finbert_used = True
-        else:
-            result = _score_headline_with_vader(headline)
-        if result is not None:
-            scored.append((headline, result[0], result[1]))
-
-    if not scored:
-        return {**empty, "news_headlines": headlines, "news_count": len(headlines), "news_headline": headlines[0]}
-
-    scored.sort(key=lambda item: abs(item[1]), reverse=True)
-    ordered_headlines = [h for h, _, _ in scored]
-    avg_score = round(float(sum(item[1] for item in scored) / len(scored)), 3)
-    sentiment = _label_from_score(avg_score)
-    multiplier = _news_multiplier_from_score(avg_score)
-
-    return {
-        "news_score": avg_score,
-        "news_sentiment": sentiment,
-        "news_headline": ordered_headlines[0],
-        "news_headlines": ordered_headlines,
-        "news_count": len(ordered_headlines),
-        "news_multiplier": multiplier,
-        "news_source": "finbert" if finbert_used else ("vader" if _VADER_OK else "headlines_only"),
-        "news_alert": False,
-    }
 
 
 def get_signal_streaks(today: str) -> dict[str, tuple[str, int]]:
@@ -1216,7 +1001,7 @@ def context(df: pd.DataFrame, p: dict) -> dict:
         return sanitize_for_json({
             "price": None, "change_1d": None, "change_5d": None,
             "rsi": None, "macd_hist": None, "ema_bullish": None,
-            "supertrend_up": None, "supertrend_line": None,
+            "supertrend_up": None, "supertrend_line": None,   # legacy NULL for schema compat
             "support": None, "resistance": None,
             "stop_loss": None, "target": None,
             "risk_pct": None, "reward_pct": None, "rr_ratio": None,
@@ -1227,7 +1012,7 @@ def context(df: pd.DataFrame, p: dict) -> dict:
     _, _, h  = macd(c, p["MACD_FAST"], p["MACD_SLOW"], p["MACD_SIGNAL"])
     e_s      = float(ema(c, p["EMA_SHORT"]).iloc[-1])
     e_l      = float(ema(c, p["EMA_LONG"]).iloc[-1])
-    trend, st_line = supertrend(df.High, df.Low, c, p["ATR_PERIOD"], p["SUPERTREND_MULT"])
+    # v7: Supertrend computation removed.
 
     price   = float(c.iloc[-1])
     atr_now = float(atr(df.High, df.Low, c, p["ATR_PERIOD"]).iloc[-1])
@@ -1253,9 +1038,9 @@ def context(df: pd.DataFrame, p: dict) -> dict:
         macd_hist   = round(float(h.iloc[-1]), 3)
                       if pd.notna(h.iloc[-1]) and math.isfinite(float(h.iloc[-1])) else None,
         ema_bullish     = bool(e_s > e_l) if math.isfinite(e_s) and math.isfinite(e_l) else None,
-        supertrend_up   = bool(trend.iloc[-1] == 1) if pd.notna(trend.iloc[-1]) else None,
-        supertrend_line = round(float(st_line.iloc[-1]), 2)
-                          if pd.notna(st_line.iloc[-1]) and math.isfinite(float(st_line.iloc[-1])) else None,
+        # v7: supertrend_up / supertrend_line set to None for schema compat with older dashboards.
+        supertrend_up   = None,
+        supertrend_line = None,
         support    = round(float(low20),  2) if low20 is not None and math.isfinite(float(low20))  else None,
         resistance = round(float(high20), 2) if high20 is not None and math.isfinite(float(high20)) else None,
         stop_loss  = sl,
@@ -1307,15 +1092,12 @@ def run():
     tg_token  = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     tg_chat   = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-    if not hf_token:
-        if _VADER_OK:
-            print("  ℹ️  HF_TOKEN not set — news sentiment will use VADER fallback")
-        else:
-            print("  ℹ️  HF_TOKEN not set and vaderSentiment unavailable — news disabled")
+    if hf_token:
+        print("  ℹ️  HF_TOKEN set — using FinBERT for news sentiment")
+    else:
+        print("  ℹ️  HF_TOKEN not set — falling back to VADER + financial overrides")
     if not tg_token:
         print("  ℹ️  TELEGRAM_BOT_TOKEN not set — Telegram alerts disabled")
-    if not _GNEWS_OK:
-        print("  ℹ️  gnews not installed — news features disabled")
 
     print(f"   Params : {param_version}")
     print(f"   Stocks : {len(ALL_TICKERS)} NSE tickers\n")
@@ -1361,8 +1143,25 @@ def run():
                 continue
             gate_counts["any_signal"] += 1
 
-            bt     = {name: backtest(df, fn(df), P, benchmark_df) for name, fn in STRATEGIES.items()}
             action = "BUY" if buy_count >= sell_count else "EXIT"
+
+            # ─── v7 HARD GATES ─────────────────────────────────────
+            # Gate 1: anti-confirmation. Production data shows multi-strategy
+            # BUYs win 65% vs single-strategy 71% (n=170 vs n=49). The
+            # "vote of N strategies" logic was amplifying late-stage rare
+            # alignments, which behave like exhaustion moves.
+            if action == "BUY" and buy_count > 1:
+                gate_counts["rejected_multi_strat"] = gate_counts.get("rejected_multi_strat", 0) + 1
+                continue
+            # Gate 2: bearish-regime veto. 44% of failing top-quartile
+            # signals were BEARISH regime; the soft -10pt nudge wasn't
+            # enough to keep them off the leaderboard.
+            if action == "BUY" and regime_label == "BEARISH":
+                gate_counts["rejected_bearish_regime"] = gate_counts.get("rejected_bearish_regime", 0) + 1
+                continue
+            # ────────────────────────────────────────────────────────
+
+            bt     = {name: backtest(df, fn(df), P, benchmark_df) for name, fn in STRATEGIES.items()}
             w_ratio, weights = weighted_vote(today_sigs, bt, action)
 
             if w_ratio < P["MIN_WEIGHTED_SCORE"]:
@@ -1377,14 +1176,10 @@ def run():
             fund = fetch_fundamentals(ticker)
             company_name = fund.get("company_name") or NSE_COMPANY_NAMES.get(ticker, ticker)
 
-            # ── News sentiment (gate on score + at least one available backend)
-            # Previously only ran when HF_TOKEN was set, which silently disabled
-            # VADER even when it was installed. Now: run if EITHER FinBERT
-            # (HF token) OR VADER is available, and gnews can fetch headlines.
-            news_backend_ok = _GNEWS_OK and (bool(hf_token) or _VADER_OK)
-            if technical_score >= 25 and news_backend_ok:
+            # ── News sentiment (v7: agent/news_v2.py owns this — junk
+            # filter + financial overrides for "profit booking" etc.)
+            if technical_score >= 25:
                 news = fetch_news_sentiment(ticker, company_name, hf_token)
-                # news_alert: technical signal contradicts news sentiment
                 news["news_alert"] = (
                     (action == "BUY"  and news.get("news_sentiment") == "NEGATIVE") or
                     (action == "EXIT" and news.get("news_sentiment") == "POSITIVE")
@@ -1506,12 +1301,14 @@ def run():
     # ── Pipeline summary
     failed_count = sum(1 for l in run_logs if l["status"] != "ok")
     print(f"  Pipeline summary:")
-    print(f"    Tickers scanned  : {len(ALL_TICKERS)}")
-    print(f"    Data fetched OK  : {gate_counts['fetched']}")
-    print(f"    Any signal fired : {gate_counts['any_signal']}")
-    print(f"    Passed weight    : {gate_counts['passed_weight']}  (threshold={P['MIN_WEIGHTED_SCORE']})")
-    print(f"    Final signals    : {len(records)}")
-    print(f"    Failed fetches   : {failed_count}\n")
+    print(f"    Tickers scanned         : {len(ALL_TICKERS)}")
+    print(f"    Data fetched OK         : {gate_counts['fetched']}")
+    print(f"    Any signal fired        : {gate_counts['any_signal']}")
+    print(f"    Rejected: multi-strat   : {gate_counts.get('rejected_multi_strat', 0)}")
+    print(f"    Rejected: bearish regime: {gate_counts.get('rejected_bearish_regime', 0)}")
+    print(f"    Passed weight           : {gate_counts['passed_weight']}  (threshold={P['MIN_WEIGHTED_SCORE']})")
+    print(f"    Final signals           : {len(records)}")
+    print(f"    Failed fetches          : {failed_count}\n")
 
     # ── Market breadth
     breadth = compute_market_breadth(records)

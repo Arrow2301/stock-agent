@@ -194,6 +194,35 @@ def live_price(ticker):
     except Exception:
         return 0.0
 
+
+# v7: full-OHLC breach detection from agent/market_data.py.
+# Comparing latest close to SL/target misses intraday wicks that
+# recover by close. position_breach() walks every trading day since
+# entry and reports the first SL or target hit it finds — matching
+# the convention used by agent/backsimulate.py.
+import sys as _sys, os as _os
+_sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), "..", "agent"))
+try:
+    from market_data import fetch_ohlc_since, detect_breach
+    _BREACH_OK = True
+except ImportError:
+    _BREACH_OK = False
+
+@st.cache_data(ttl=120)
+def position_breach(ticker, buy_date, entry_price, sl, tgt):
+    """Detect any SL/target breach since buy_date. Returns dict or None."""
+    if not _BREACH_OK or not buy_date or not entry_price:
+        return None
+    try:
+        df = fetch_ohlc_since(ticker, buy_date)
+        if df.empty:
+            return None
+        return detect_breach(df, float(entry_price),
+                             float(sl) if sl else None,
+                             float(tgt) if tgt else None)
+    except Exception:
+        return None
+
 @st.cache_data(ttl=600)
 def price_history(ticker, days=90):
     try:
@@ -284,25 +313,52 @@ def promote_param(version, new_status):
     st.cache_data.clear()
 
 def check_exit_alerts(port):
+    """
+    v7: detect SL/target breaches by examining the *full intraday range
+    over every day since entry*, not just today's close. Honours an
+    existing breach_flag persisted by agent/check_alerts.py so re-runs
+    don't 'un-alert' when price recovers.
+    """
     alerts = []
     if port.empty:
         return alerts
     for _, row in port[port.status == "OPEN"].iterrows():
-        lp = live_price(row.ticker)
-        if lp <= 0:
-            continue
         sl  = safe_float(row.get("entry_stop_loss"), 0)
         tgt = safe_float(row.get("entry_target"), 0)
         buy = safe_float(row.get("buy_price"), 0)
-        pnl = round((lp - buy) / buy * 100, 2) if buy > 0 else 0
-        if sl > 0 and lp <= sl:
-            alerts.append({"ticker": row.ticker, "type": "SL_HIT", "lp": lp,
-                            "level": sl, "pnl": pnl, "id": row.id,
-                            "buy_price": buy, "qty": row.quantity})
-        elif tgt > 0 and lp >= tgt:
-            alerts.append({"ticker": row.ticker, "type": "TARGET_HIT", "lp": lp,
-                            "level": tgt, "pnl": pnl, "id": row.id,
-                            "buy_price": buy, "qty": row.quantity})
+        if buy <= 0 or (sl <= 0 and tgt <= 0):
+            continue
+
+        # Sticky: respect a previously-persisted breach.
+        prior = row.get("breach_flag") if "breach_flag" in row.index else None
+        if prior in ("sl_hit", "target_hit"):
+            fill = safe_float(row.get("breach_price"), 0) or live_price(row.ticker)
+            pnl  = round((fill - buy) / buy * 100, 2) if buy > 0 else 0
+            alerts.append({"ticker": row.ticker,
+                           "type":   "SL_HIT" if prior == "sl_hit" else "TARGET_HIT",
+                           "lp":     fill, "level": sl if prior == "sl_hit" else tgt,
+                           "pnl":    pnl,  "id": row.id,
+                           "buy_price": buy, "qty": row.quantity, "sticky": True})
+            continue
+
+        breach = position_breach(
+            ticker=row.ticker,
+            buy_date=str(row.get("buy_date") or "")[:10],
+            entry_price=buy,
+            sl=sl if sl > 0 else None,
+            tgt=tgt if tgt > 0 else None,
+        )
+        if breach is None:
+            continue
+        fill = float(breach["fill_price"])
+        pnl  = round((fill - buy) / buy * 100, 2) if buy > 0 else 0
+        alerts.append({"ticker": row.ticker,
+                       "type":   "SL_HIT" if breach["type"] == "sl_hit" else "TARGET_HIT",
+                       "lp":     fill, "level": breach["level"],
+                       "pnl":    pnl,  "id": row.id,
+                       "buy_price": buy, "qty": row.quantity,
+                       "breach_date": breach["breach_date"],
+                       "gapped":      breach.get("gapped", False)})
     return alerts
 
 def compute_portfolio_snapshot(port):
@@ -883,16 +939,46 @@ elif page == "💼 My Paper Portfolio":
                 lp = row.buy_price; pnl_pct = pnl_inr = 0
             sl  = safe_float(row.get("entry_stop_loss"), 0)
             tgt = safe_float(row.get("entry_target"), 0)
-            sl_hit  = sl > 0 and lp <= sl
-            tgt_hit = tgt > 0 and lp >= tgt
+
+            # v7: breach detection prefers a persisted flag (sticky), then
+            # full-OHLC scan from entry day onward (not just today's close).
+            prior_flag = row.get("breach_flag") if "breach_flag" in row.index else None
+            if prior_flag in ("sl_hit", "target_hit"):
+                breach = {
+                    "type":        prior_flag,
+                    "fill_price":  safe_float(row.get("breach_price"), lp),
+                    "breach_date": row.get("breach_date"),
+                    "gapped":      False,
+                }
+            else:
+                breach = position_breach(
+                    ticker=row.ticker,
+                    buy_date=str(row.get("buy_date") or "")[:10],
+                    entry_price=safe_float(row.buy_price),
+                    sl=sl if sl > 0 else None,
+                    tgt=tgt if tgt > 0 else None,
+                )
+
+            sl_hit  = bool(breach and breach["type"] == "sl_hit")
+            tgt_hit = bool(breach and breach["type"] == "target_hit")
             icon    = "🚨" if sl_hit else ("🎯" if tgt_hit else ("🟢" if pnl_pct >= 0 else "🔴"))
             with st.expander(
                 f"{icon} **{row.ticker}** | {safe_int(row.quantity)} shares | "
                 f"Buy ₹{safe_float(row.buy_price):,.2f} → Live ₹{lp:,.2f} | "
                 f"P&L {pnl_pct:+.2f}%", expanded=sl_hit or tgt_hit
             ):
-                if sl_hit:  st.error(f"🚨 Stop-loss breached! ₹{lp:,.2f} ≤ SL ₹{sl:,.2f}")
-                if tgt_hit: st.success(f"🎯 Target hit! ₹{lp:,.2f} ≥ Target ₹{tgt:,.2f}")
+                if sl_hit:
+                    bd  = breach.get("breach_date") or "today"
+                    gap = " (gap-down)" if breach.get("gapped") else ""
+                    fill = breach["fill_price"]
+                    st.error(f"🚨 Stop-loss breached on {bd}{gap}! "
+                             f"Filled at ₹{fill:,.2f} (SL was ₹{sl:,.2f})")
+                if tgt_hit:
+                    bd  = breach.get("breach_date") or "today"
+                    gap = " (gap-up)" if breach.get("gapped") else ""
+                    fill = breach["fill_price"]
+                    st.success(f"🎯 Target hit on {bd}{gap}! "
+                               f"Filled at ₹{fill:,.2f} (Target was ₹{tgt:,.2f})")
                 pc1, pc2, pc3 = st.columns(3)
                 pc1.metric("Buy Price",  fmt_inr(row.buy_price))
                 pc1.metric("Buy Date",   str(row.buy_date))
