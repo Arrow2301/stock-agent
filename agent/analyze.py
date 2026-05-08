@@ -1,34 +1,29 @@
 #!/usr/bin/env python3
 """
 ============================================================
-  Indian Stock Market Analysis Agent  —  v7
-  Runs daily via GitHub Actions (skips on NSE holidays)
+  Indian Stock Market Analysis Agent  —  v7 + Phase 2
 
-  Changes from v6 → v7
-  ────────────────────
-  Data-driven cleanup based on analysis of 932 recommendations
-  and 239 backsimulated outcomes:
+  Phase 2 additions:
+  ─ Calibrated LR scorer (agent/score_model.py) loaded once at
+    startup. Each BUY signal gets a P(win) prediction stored on
+    the recommendation row. The model AUGMENTS composite_score;
+    it does not replace it. The leaderboard still sorts by
+    final_score until Patch 6 is applied (after 2 weeks of A/B).
+  ─ context() extended with: change_30d, pct_from_52w_high,
+    pct_from_52w_low, atr_pct (all needed as model features).
+  ─ momentum_vs_nifty_30d() helper added — the strongest
+    relative-strength feature in the LR.
 
-  ─ Strategy roster reduced 6 → 4. Removed:
-      * RSI + MACD     — fired 0 times in 932 recs
-      * Volume Breakout — Donchian-alone WR 69.4% drops to
-        58.6% when paired with VB; the "confirmation"
-        actively destroys edge.
-  ─ Supertrend computation removed entirely. It was never in
-    the strategy list, only displayed; pure overhead.
-  ─ Hard gate: BUY signals require exactly one strategy
-    firing. Multi-strategy signals win 65% vs single 71%.
-  ─ Hard gate: BEARISH regime vetoes all new longs (was a
-    soft -10pt nudge that wasn't enough).
-  ─ News sentiment moved to news_v2.py — junk-headline filter
-    + financial-keyword overrides for "profit booking",
-    "downgrade to sell", etc. that VADER mis-classifies.
-  ─ Optional: momentum_vs_nifty_30d feature recorded for use
-    in Phase 2 LR scoring model.
-  ─ Holiday-aware: workflow now skips on NSE holidays.
+  v7 changes (carried forward):
+  ─ Strategy roster reduced 6 → 4 (RSI+MACD, Volume Breakout
+    removed based on production data analysis).
+  ─ Supertrend computation removed.
+  ─ Hard gates: BUY rejected if multi-strat fires or BEARISH regime.
+  ─ News sentiment via agent/news_v2.py (junk filter + financial
+    keyword overrides for "profit booking" etc.).
+  ─ Holiday-aware: workflow skips on NSE holidays.
 
-  Carried over from v6
-  ────────────────────
+  Carried over from v6:
   ─ Fundamental screening (P/E, D/E, ROE, revenue growth)
   ─ Signal streak tracking
   ─ Market breadth metric in agent_meta
@@ -54,6 +49,16 @@ from supabase import create_client, Client
 # News scoring lives in agent/news_v2.py (junk filter + financial overrides).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from news_v2 import fetch_news_sentiment   # noqa: E402
+
+# Phase 2: calibrated LR scorer. Loaded lazily; if no champion model
+# exists in Supabase yet, _SCORE_MODEL is None and the agent falls
+# back to legacy composite_score-only behaviour. No-op if unavailable.
+try:
+    from score_model import load_model, predict_p_win
+    _SCORE_MODEL = load_model()           # (pipeline, feature_list) or None
+except Exception as _score_err:
+    print(f"  ⚠️  score_model unavailable: {_score_err}")
+    _SCORE_MODEL = None
 
 warnings.filterwarnings("ignore")
 
@@ -999,13 +1004,15 @@ def context(df: pd.DataFrame, p: dict) -> dict:
     c = df.Close
     if len(c) < 20:
         return sanitize_for_json({
-            "price": None, "change_1d": None, "change_5d": None,
+            "price": None, "change_1d": None, "change_5d": None, "change_30d": None,
             "rsi": None, "macd_hist": None, "ema_bullish": None,
             "supertrend_up": None, "supertrend_line": None,   # legacy NULL for schema compat
             "support": None, "resistance": None,
             "stop_loss": None, "target": None,
             "risk_pct": None, "reward_pct": None, "rr_ratio": None,
             "volume": 0, "avg_volume": 0,
+            # Phase 2 features (LR scorer needs these even when 'price' is None)
+            "atr_pct": None, "pct_from_52w_high": None, "pct_from_52w_low": None,
         })
 
     r        = float(rsi(c, p["RSI_PERIOD"]).iloc[-1])
@@ -1017,8 +1024,20 @@ def context(df: pd.DataFrame, p: dict) -> dict:
     price   = float(c.iloc[-1])
     atr_now = float(atr(df.High, df.Low, c, p["ATR_PERIOD"]).iloc[-1])
 
-    prev_1 = float(c.iloc[-2]) if len(c) >= 2 and pd.notna(c.iloc[-2]) else None
-    prev_5 = float(c.iloc[-6]) if len(c) >= 6 and pd.notna(c.iloc[-6]) else None
+    prev_1  = float(c.iloc[-2])  if len(c) >= 2  and pd.notna(c.iloc[-2])  else None
+    prev_5  = float(c.iloc[-6])  if len(c) >= 6  and pd.notna(c.iloc[-6])  else None
+    prev_30 = float(c.iloc[-31]) if len(c) >= 31 and pd.notna(c.iloc[-31]) else None
+
+    # Phase 2: 52-week range and ATR percentage — features for the LR.
+    lookback         = min(252, len(c))
+    high_52w         = float(c.iloc[-lookback:].max())
+    low_52w          = float(c.iloc[-lookback:].min())
+    pct_from_52w_high = (round((price - high_52w) / high_52w * 100, 2)
+                         if high_52w > 0 and math.isfinite(high_52w) else None)
+    pct_from_52w_low  = (round((price - low_52w)  / low_52w  * 100, 2)
+                         if low_52w  > 0 and math.isfinite(low_52w)  else None)
+    atr_pct           = (round(atr_now / price * 100, 3)
+                         if price > 0 and math.isfinite(atr_now) else None)
 
     levels = dynamic_trade_levels(df, len(df) - 1, price, p)
     sl  = levels.get("stop_loss")
@@ -1034,6 +1053,8 @@ def context(df: pd.DataFrame, p: dict) -> dict:
                     if prev_1 not in (None, 0) and math.isfinite(prev_1) else None,
         change_5d = round((price - prev_5) / prev_5 * 100, 2)
                     if prev_5 not in (None, 0) and math.isfinite(prev_5) else None,
+        change_30d = round((price - prev_30) / prev_30 * 100, 2)
+                    if prev_30 not in (None, 0) and math.isfinite(prev_30) else None,
         rsi         = round(r, 1) if math.isfinite(r) else None,
         macd_hist   = round(float(h.iloc[-1]), 3)
                       if pd.notna(h.iloc[-1]) and math.isfinite(float(h.iloc[-1])) else None,
@@ -1051,8 +1072,84 @@ def context(df: pd.DataFrame, p: dict) -> dict:
         rr_floor_applied = bool(levels.get("rr_floor_applied", False)),
         volume     = int(df.Volume.iloc[-1]) if pd.notna(df.Volume.iloc[-1]) else 0,
         avg_volume = int(vol20) if pd.notna(vol20) and math.isfinite(float(vol20)) else 0,
+        # Phase 2 features (consumed by signal_features_for_model)
+        atr_pct           = atr_pct,
+        pct_from_52w_high = pct_from_52w_high,
+        pct_from_52w_low  = pct_from_52w_low,
     )
     return sanitize_for_json(out)
+
+
+# ─────────────────────────────────────────────
+#  PHASE 2 — MODEL FEATURE PACKING
+#  Helpers used only when _SCORE_MODEL is loaded.
+# ─────────────────────────────────────────────
+
+_REGIME_SCORE_MAP = {"BULLISH": 1.0, "NEUTRAL": 0.5, "BEARISH": 0.0}
+
+
+def momentum_vs_nifty_30d(df, benchmark_df, days: int = 30):
+    """
+    Stock 30-day return minus Nifty 30-day return. The single strongest
+    relative-strength feature in the LR scorer. Returns None if there
+    isn't enough history on either side.
+    """
+    if benchmark_df is None or benchmark_df.empty or len(df) < days + 1:
+        return None
+    try:
+        stock_ret = (df.Close.iloc[-1] / df.Close.iloc[-(days + 1)] - 1) * 100
+        # Align to the most recent benchmark date <= our last bar
+        bench = benchmark_df[benchmark_df.index <= df.index[-1]]
+        if len(bench) < days + 1:
+            return None
+        bench_ret = (bench.Close.iloc[-1] / bench.Close.iloc[-(days + 1)] - 1) * 100
+        return round(float(stock_ret - bench_ret), 2)
+    except Exception:
+        return None
+
+
+def signal_features_for_model(ctx: dict, today_sigs: dict, regime_label: str,
+                              mom_vs_nifty_30d) -> dict:
+    """
+    Pack the v7 signal context into the dict shape score_model expects.
+    Keys must match score_model.ALL_FEATURES exactly. Missing values
+    default to neutral (0 or 0.5) so the model still produces a
+    prediction even when data is sparse.
+    """
+    has_donchian   = int(today_sigs.get("Donchian",        0) ==  1)
+    has_ema        = int(today_sigs.get("EMA Crossover",   0) ==  1)
+    has_rsi_trend  = int(today_sigs.get("RSI Trend Shift", 0) ==  1)
+    has_bollinger  = int(today_sigs.get("Bollinger",       0) ==  1)
+    n_firing       = has_donchian + has_ema + has_rsi_trend + has_bollinger
+
+    vol_now = ctx.get("volume", 0) or 0
+    vol_avg = ctx.get("avg_volume", 0) or 0
+    vol_ratio = round(vol_now / vol_avg, 3) if vol_avg > 0 else 1.0
+
+    return {
+        "rsi":               ctx.get("rsi") if ctx.get("rsi") is not None else 50,
+        "macd_hist":         ctx.get("macd_hist") if ctx.get("macd_hist") is not None else 0,
+        "atr_pct":           ctx.get("atr_pct") if ctx.get("atr_pct") is not None else 0,
+        "change_1d":         ctx.get("change_1d") if ctx.get("change_1d") is not None else 0,
+        "change_5d":         ctx.get("change_5d") if ctx.get("change_5d") is not None else 0,
+        "change_30d":        ctx.get("change_30d") if ctx.get("change_30d") is not None else 0,
+        "pct_from_52w_high": ctx.get("pct_from_52w_high") if ctx.get("pct_from_52w_high") is not None else 0,
+        "pct_from_52w_low":  ctx.get("pct_from_52w_low")  if ctx.get("pct_from_52w_low")  is not None else 0,
+        "vol_ratio":         vol_ratio,
+        "n_firing":          n_firing,
+        "risk_pct":          ctx.get("risk_pct") if ctx.get("risk_pct") is not None else 0,
+        "reward_pct":        ctx.get("reward_pct") if ctx.get("reward_pct") is not None else 0,
+        "rr_ratio":          ctx.get("rr_ratio") if ctx.get("rr_ratio") is not None else 0,
+        "regime_score":      _REGIME_SCORE_MAP.get(regime_label, 0.5),
+        "mom_vs_nifty_30d":  mom_vs_nifty_30d if mom_vs_nifty_30d is not None else 0,
+        "ema_bullish":       int(bool(ctx.get("ema_bullish"))),
+        "has_donchian":      has_donchian,
+        "has_ema":           has_ema,
+        "has_rsi_trend":     has_rsi_trend,
+        "has_bollinger":     has_bollinger,
+        "single_strat":      int(n_firing == 1),
+        "multi_strat":       int(n_firing >= 2),
+    }
 
 # ─────────────────────────────────────────────
 #  MARKET REGIME  (NIFTY 50 EMA trend)
@@ -1207,6 +1304,23 @@ def run():
                 "final_score_multiplier": final_multiplier,
             })
 
+            # ── Phase 2: calibrated P(win) from the LR scorer.
+            # Augments composite_score by ranking signals by predicted
+            # win probability. Only runs for BUY signals; EXIT signals
+            # leave p_win as None. Falls back gracefully if the model
+            # isn't loaded (e.g. before the first training run).
+            p_win_score = None
+            if _SCORE_MODEL is not None and action == "BUY":
+                pipeline, feats = _SCORE_MODEL
+                mom = momentum_vs_nifty_30d(df, benchmark_df)
+                sig_feats = signal_features_for_model(ctx, today_sigs, regime_label, mom)
+                try:
+                    p_win_score = round(predict_p_win(pipeline, feats, sig_feats), 4)
+                except Exception as e:
+                    print(f"  ⚠️  predict_p_win failed for {ticker}: {e}")
+                    p_win_score = None
+            c_breakdown["p_win"] = p_win_score
+
             # ── Signal streak (previous days + today = total)
             # Reset to 1 if today's action flips relative to the previous streak.
             prev_action, prev_streak = streaks.get(ticker, (None, 0))
@@ -1284,6 +1398,8 @@ def run():
                 # Streak
                 signal_streak     = streak_today,
                 streak            = streak_today,
+                # Phase 2: predicted P(win) for BUYs (None for EXITs)
+                p_win             = p_win_score,
                 **ctx,
             )
 
