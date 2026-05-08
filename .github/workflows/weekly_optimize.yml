@@ -1,12 +1,20 @@
 name: Weekly Parameter Optimization
 
-on:
-  # Runs every Sunday at 17:30 UTC = 11:00 PM IST
-  # (markets closed, fresh week of data available)
-  schedule:
-    - cron: "30 17 * * 0"
+# v7: scheduled cron DISABLED.
+#
+# The optimiser currently maximises composite_score, which production
+# data shows is anti-predictive (Pearson r = -0.262 with win, p < 0.0001
+# across 239 backsim trades). Every weekly run was therefore drifting
+# the champion params in the wrong direction. The most recent runs
+# show this — May 3 best WR was 51% vs the historical 68% reality.
+#
+# Re-enable once Phase 2 (calibrated LR scoring model in agent/score_model.py)
+# is in place AND the Optuna objective is switched from "best_score" to
+# "model holdout AUC". Until then, manual triggering only.
 
-  # Manual trigger from GitHub UI
+on:
+  # schedule:
+  #   - cron: "30 17 * * 0"   # Sunday 11 PM IST — DISABLED in v7
   workflow_dispatch:
     inputs:
       n_trials:
@@ -17,7 +25,7 @@ on:
 jobs:
   optimize:
     runs-on: ubuntu-latest
-    timeout-minutes: 90      # optimization can take up to 60-75 min
+    timeout-minutes: 90
 
     steps:
       - name: Checkout code

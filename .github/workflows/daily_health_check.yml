@@ -1,0 +1,35 @@
+name: Daily Health Check
+
+# Runs after Indian market close (15:30 IST). Computes a small set
+# of health metrics and writes them to the health_checks table.
+# Sends a Telegram alert if any check WARNs or FAILs.
+#
+# Schedule: 10:30 UTC = ~16:00–16:30 IST (free-tier delay tolerated)
+
+on:
+  schedule:
+    - cron: "30 10 * * 1-5"
+  workflow_dispatch:
+
+jobs:
+  health-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - run: pip install -r requirements.txt
+
+      - name: Run health check
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python agent/health_check.py

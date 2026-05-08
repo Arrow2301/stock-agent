@@ -1,14 +1,22 @@
 name: Daily Stock Analysis
 
-on:
-  # Scheduled at 01:00 UTC = 06:30 AM IST
-  # GitHub free tier can delay up to 1-2 hours, so worst case ~8:30 AM IST
-  # Still before NSE market open at 9:15 AM IST
-  schedule:
-    - cron: "10 0 * * 1-5"   # Monday–Friday 01:00 UTC = 06:30 AM IST
+# Schedule: 01:10 UTC = 06:40 AM IST. GitHub free tier can delay up to
+# ~1-2 hours but worst case (08:30 AM IST) is still before NSE open
+# at 09:15 AM IST.
+#
+# Behaviour change vs v1: this workflow now skips on Indian market
+# holidays (driven by agent/holiday_calendar.py). The skip step exits 0
+# so the workflow still shows green in the Actions tab on holidays.
 
-  # Also allow manual trigger from GitHub UI
+on:
+  schedule:
+    - cron: "10 0 * * 1-5"
   workflow_dispatch:
+    inputs:
+      force:
+        description: "Force run even if today is a market holiday"
+        required: false
+        default: "false"
 
 jobs:
   analyse:
@@ -28,11 +36,23 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Holiday check
+        id: holiday
+        run: |
+          set -e
+          IS_OPEN=$(python -c "from agent.holiday_calendar import is_market_open; print('yes' if is_market_open() else 'no')")
+          echo "is_open=${IS_OPEN}" >> "$GITHUB_OUTPUT"
+          if [ "${IS_OPEN}" = "no" ] && [ "${{ github.event.inputs.force }}" != "true" ]; then
+            echo "🇮🇳 NSE is closed today — skipping daily analysis."
+            echo "Use the 'force' input from workflow_dispatch to override."
+          fi
+
       - name: Run stock analysis
+        if: steps.holiday.outputs.is_open == 'yes' || github.event.inputs.force == 'true'
         env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          SUPABASE_URL:       ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY:       ${{ secrets.SUPABASE_KEY }}
+          HF_TOKEN:           ${{ secrets.HF_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python agent/analyze.py
