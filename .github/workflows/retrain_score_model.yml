@@ -1,0 +1,57 @@
+name: Weekly Score Model Retrain
+
+# Refits the calibrated LR scoring model on the latest synthetic
+# training data + any new closed paper trades. Runs Sunday 17:00 IST
+# AFTER the weekly backsimulation has populated new outcomes.
+#
+# If holdout AUC drops below 0.55 the script aborts and the previous
+# champion is kept — the live agent never picks up a degraded model.
+
+on:
+  schedule:
+    - cron: "30 11 * * 0"      # Sunday 11:30 UTC = 5:00 PM IST
+  workflow_dispatch:
+    inputs:
+      cutoff:
+        description: "Train/test cutoff date (default: 80th-percentile signal_date)"
+        required: false
+        default: ""
+      no_save:
+        description: "Train and report only — don't save model"
+        type: boolean
+        required: false
+        default: false
+
+jobs:
+  retrain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install scikit-learn>=1.3.0
+
+      - name: Retrain scoring model
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          ARGS=""
+          if [ -n "${{ inputs.cutoff }}" ]; then
+            ARGS="$ARGS --cutoff ${{ inputs.cutoff }}"
+          fi
+          if [ "${{ inputs.no_save }}" = "true" ]; then
+            ARGS="$ARGS --no-save"
+          fi
+          python agent/score_model.py $ARGS

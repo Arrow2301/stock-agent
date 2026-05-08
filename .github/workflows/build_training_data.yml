@@ -1,0 +1,60 @@
+name: Build Synthetic Training Data
+
+# Manual trigger only. This is a long-running job (~30-60 min) that
+# walks the v7 strategies through 5 years of historical NSE data and
+# writes ~10,000-30,000 labelled (signal, outcome) rows to Supabase.
+# Run it ONCE to seed Phase 2 training, then again whenever you want
+# to refresh / extend the dataset (e.g. after adding a new strategy).
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: "Start date (YYYY-MM-DD)"
+        required: false
+        default: "2020-04-01"
+      end_date:
+        description: "End date (YYYY-MM-DD)"
+        required: false
+        default: "2026-04-30"
+      tickers:
+        description: "Comma-separated tickers (blank = full Nifty 50 + extras)"
+        required: false
+        default: ""
+      purge:
+        description: "Truncate synthetic_training_data first?"
+        type: boolean
+        required: false
+        default: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Build training data
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          ARGS="--start ${{ inputs.start_date }} --end ${{ inputs.end_date }}"
+          if [ -n "${{ inputs.tickers }}" ]; then
+            ARGS="$ARGS --tickers ${{ inputs.tickers }}"
+          fi
+          if [ "${{ inputs.purge }}" = "true" ]; then
+            ARGS="$ARGS --purge"
+          fi
+          python agent/build_training_data.py $ARGS
