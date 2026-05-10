@@ -1,137 +1,168 @@
-# 🇮🇳 Indian Stock Agent — Complete Setup Guide
+# 🇮🇳 Indian Stock Agent — v8
 
-**100% free. 100% online. Zero local setup required.**
+A daily NSE signal-generation pipeline + paper-trading dashboard.
+100 % free hosting (GitHub Actions + Supabase + Streamlit Cloud).
+
+> ⚠️ **Paper trading only.** Not financial advice. See disclaimer at the bottom.
 
 ---
 
 ## Architecture
 
 ```
-GitHub Actions (7 AM IST)
-    │
-    ▼  runs analyze.py
-    │
-    ▼  writes signals
-Supabase (free PostgreSQL)
-    │
-    ▼  reads signals + paper trades
-Streamlit Community Cloud (free dashboard)
+┌────────────────────────┐
+│ GitHub Actions cron    │  Mon-Fri 07:00 IST  →  agent/analyze.py
+│   (also: weekly        │  Mon-Fri 12:00 IST  →  agent/check_alerts.py (midday SL/target check)
+│    backsim, weekly     │  Mon-Fri 19:00 IST  →  agent/health_check.py
+│    optimizer*, build   │  Sun   23:00 IST    →  agent/backsimulate.py
+│    training data,      │  Sun   23:00 IST    →  agent/optimize.py     *cron disabled, manual only
+│    retrain model)      │  Sat   02:00 IST    →  agent/build_training_data.py
+└──────────┬─────────────┘  Sat   04:00 IST    →  agent/score_model.py
+           │
+           ▼ writes signals + meta + breach flags
+┌────────────────────────┐
+│ Supabase (PostgreSQL)  │
+│ recommendations         │
+│ paper_portfolio         │
+│ agent_meta / params     │
+│ score_models / synth_*  │
+│ backtest_simulations    │
+└──────────┬─────────────┘
+           │
+           ▼ reads + paper trades
+┌────────────────────────┐
+│ Streamlit dashboard    │  password-gated
+│ dashboard/app.py        │
+└────────────────────────┘
 ```
 
 ---
 
-## Step 1 — Create Supabase Database (~5 minutes)
+## Quick Start
 
-1. Go to **[supabase.com](https://supabase.com)** → Sign up free
-2. Click **"New Project"** → give it a name (e.g. `stock-agent`) → set a database password → **Create project**
-3. Wait ~2 minutes for it to spin up
-4. In the left sidebar, click **SQL Editor** → **New Query**
-5. Copy the entire contents of `supabase_setup.sql` and paste it in → click **Run**
-   - This creates 3 tables: `recommendations`, `paper_portfolio`, `agent_meta`
-6. Go to **Settings → API**:
-   - Copy **Project URL** → save this as `SUPABASE_URL`
-   - Copy **anon / public key** → save this as `SUPABASE_KEY`
-
----
-
-## Step 2 — Push to GitHub (~3 minutes)
-
-1. Go to **[github.com](https://github.com)** → Sign up free (if you don't have an account)
-2. Click **"New repository"** → name it `stock-agent` → set to **Public** → **Create**
-3. Upload all the project files:
-   - Click **"uploading an existing file"**
-   - Drag and drop all files/folders from this project
-   - Commit changes
-
-   > **OR** use GitHub's web editor to create files one by one — paste each file's content
-
-4. Add GitHub Secrets (your Supabase credentials):
-   - In your repo → **Settings** → **Secrets and variables** → **Actions** → **New repository secret**
-   - Add `SUPABASE_URL` with your Supabase Project URL
-   - Add `SUPABASE_KEY` with your Supabase anon key
+1. **Create a Supabase project**, open SQL Editor, paste **`supabase_setup.sql`**, run it.
+2. **Push the repo to GitHub.** Set repository secrets:
+   - `SUPABASE_URL`, `SUPABASE_KEY`
+   - `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` (optional, for daily alerts)
+   - `HF_TOKEN` (optional, enables FinBERT for news sentiment instead of VADER)
+   - `ACCOUNT_INR` (optional, default `100000`) — base capital for the
+     position-sizing recommendation
+   - `RISK_PCT_PER_TRADE` (optional, default `1.0`) — % of capital risked per trade
+3. **Run "Daily Stock Analysis" workflow once manually** to verify it writes to Supabase.
+4. **Deploy the dashboard** on Streamlit Cloud pointing at `dashboard/app.py`.
+   In Streamlit secrets set `SUPABASE_URL`, `SUPABASE_KEY`, and a strong
+   **`DASHBOARD_PASSWORD`** (this is now mandatory — no fallback).
 
 ---
 
-## Step 3 — Test the Agent (~2 minutes)
+## What the Agent Does Each Morning
 
-1. In your GitHub repo → **Actions** tab
-2. Click **"Daily Stock Analysis"** workflow
-3. Click **"Run workflow"** → **Run workflow** (green button)
-4. Watch it run (takes 3–5 minutes)
-5. Once it finishes ✅, go to Supabase → **Table Editor** → `recommendations`
-   - You should see today's buy/sell signals!
+For every Nifty 200 ticker:
 
----
-
-## Step 4 — Deploy the Dashboard (~5 minutes)
-
-1. Go to **[share.streamlit.io](https://share.streamlit.io)** → Sign in with GitHub
-2. Click **"New app"**
-3. Set:
-   - **Repository:** `your-username/stock-agent`
-   - **Branch:** `main`
-   - **Main file path:** `dashboard/app.py`
-4. Click **"Advanced settings"** → **Secrets** → paste this (with your real values):
-   ```toml
-   SUPABASE_URL = "https://xxxxxxxxxxxx.supabase.co"
-   SUPABASE_KEY = "your-anon-key"
-   DASHBOARD_PASSWORD = "your-chosen-password"
-   ```
-5. Click **Deploy** → wait ~2 minutes
-6. 🎉 Your dashboard is live at a URL like `https://your-username-stock-agent-dashboard-app-xxxx.streamlit.app`
+1. **Fetch 430 days of OHLCV** from Yahoo Finance (`<TICKER>.NS`).
+2. **Compute four strategies** (Donchian breakout, EMA crossover, RSI trend
+   shift, Bollinger). Strategy series are computed *once* and reused for
+   today's signal + the per-strategy historical backtest.
+3. **Hard gates:** reject BUYs that fire on >1 strategy (multi-strat is
+   anti-predictive in production data) and BUYs in a BEARISH NIFTY regime.
+4. **Confidence-weighted vote:** weight each strategy by `win_rate ×
+   confidence`, where confidence ramps from 0 at <5 historical trades to
+   1.0 at ≥30 trades.
+5. **Composite score** (0-100) blends strategy vote, RSI, volume, R:R and
+   regime, then is multiplied by fundamental and news multipliers.
+6. **Phase 3 P(win)** from the calibrated LightGBM scorer (if a champion
+   model is deployed in `score_models`).
+7. **Position-sizing recommendation** (new in v8) using fixed-fractional
+   risk + regime size mult + drawdown brake + sector cap. Stored as
+   `suggested_qty` on each recommendation row, surfaced in both Telegram
+   and the dashboard's paper-buy form.
+8. **EXIT-on-holding alert** (new in v8): if today's EXIT signal hits
+   a stock you currently hold, both Telegram and the dashboard portfolio
+   page surface a banner. *No auto-close.*
 
 ---
 
-## Daily Usage
+## Position Sizing (new in v8)
 
-- **Every weekday at 7:00 AM IST**, GitHub Actions automatically runs the agent
-- Open your Streamlit dashboard → **📊 Today's Signals** to see that morning's recommendations
-- Before market opens (9:15 AM IST), review signals and paper-buy stocks you like
-- Use **💼 My Paper Portfolio** to track your paper trades and P&L in real time
-- After a few weeks, check **📈 Strategy Stats** to see which strategies perform best for you
+`agent/risk.py` exposes:
+
+| Function | Purpose |
+|---|---|
+| `suggest_qty(capital, risk_pct, entry, sl)` | Fixed-fractional sizing. Caps single-position notional at 10 % of capital. |
+| `regime_size_mult(regime)` | 1.0 / 0.75 / 0.50 for BULLISH / NEUTRAL / BEAR/UNKNOWN |
+| `drawdown_brake(recent_pnls)` | Reduces sizing to 0.5× at -5 % cumulative, 0× at -10 %. |
+| `sector_room_remaining_pct(...)` | Cap at 30 % of capital per sector. |
+| `recommend_position_size(...)` | Combines all four into one call. |
+
+Defaults: ₹100,000 account, 1 % risk per trade. Override via `ACCOUNT_INR`
+and `RISK_PCT_PER_TRADE` env vars (in workflow + Streamlit secrets).
 
 ---
 
-## Customising Your Watchlist
+## Customising the Watchlist
 
-In `agent/analyze.py`, edit the `EXTRA_WATCHLIST`:
+In `agent/analyze.py`:
+
 ```python
 EXTRA_WATCHLIST = [
-    "IRCTC", "ZOMATO", "IRFC", "DELHIVERY", "TATAPOWER"
+    "TATAPOWER",   # adds beyond the Nifty 200
 ]
 ```
-Commit the change → GitHub will use it in the next morning's run.
+
+`NIFTY200` itself is a literal list — edit it if NSE re-indexes. There's a
+back-compat alias `NIFTY50 = NIFTY200` for old imports; the contents are
+the Nifty 200 despite the name.
 
 ---
 
 ## Adjusting Signal Sensitivity
 
-Also in `agent/analyze.py`:
-
-| Variable | Default | Effect |
+| Var (in `DEFAULT_PARAMS`) | Default | Effect |
 |---|---|---|
-| `MIN_BUY_SCORE` | `2` | Lower → more signals (noisier). Higher → fewer (higher conviction) |
-| `MIN_SELL_SCORE` | `2` | Same for sell signals |
-| `RSI_OVERSOLD` | `40` | Raise to `45` for more RSI-based buys |
-| `HOLD_DAYS` | `10` | Backtest holding period (doesn't affect live signals) |
+| `MIN_WEIGHTED_SCORE` | 0.08 | Higher → fewer, higher-conviction signals |
+| `RSI_OVERSOLD` / `RSI_OVERBOUGHT` | 48 / 58 | Buy/sell trigger thresholds |
+| `MIN_RR_RATIO` | 1.50 | Reject setups with reward < 1.5× risk |
+| `BT_MAX_HOLD` | 15 | Backtest max bars; affects historical win rate |
+
+When the optimizer is enabled and finds a champion, those values come from
+`agent_params` table and override `DEFAULT_PARAMS`. The optimizer cron is
+**disabled by default** in `weekly_optimize.yml` until Phase 3 is verified
+live (see file's header comment).
 
 ---
 
-## Project File Structure
+## File Structure
 
 ```
 stock-agent/
-├── .github/
-│   └── workflows/
-│       └── daily_analysis.yml   ← GitHub Actions schedule
+├── .github/workflows/        Cron-driven jobs
+│   ├── daily_analysis.yml    Mon-Fri 07:00 IST
+│   ├── midday_alert.yml      Mon-Fri 12:00 IST
+│   ├── daily_health_check.yml Mon-Fri 19:00 IST
+│   ├── weekly_backsimulate.yml Sun 23:00 IST
+│   ├── weekly_optimize.yml   manual only — see header
+│   ├── build_training_data.yml Sat 02:00 IST
+│   └── retrain_score_model.yml Sat 04:00 IST
 ├── agent/
-│   └── analyze.py               ← Core analysis engine
-├── dashboard/
-│   └── app.py                   ← Streamlit dashboard
-├── .streamlit/
-│   └── secrets.toml.template    ← Reference for Streamlit secrets
-├── supabase_setup.sql            ← Run once in Supabase SQL editor
+│   ├── analyze.py           Daily run (the main file)
+│   ├── check_alerts.py      Midday SL/target breach scanner
+│   ├── health_check.py      Daily observability snapshot
+│   ├── backsimulate.py      Walk-forward simulator for closed recs
+│   ├── optimize.py          Optuna walk-forward param search (4-strategy roster)
+│   ├── score_model.py       Calibrated LGBM (Phase 3) train + serve
+│   ├── build_training_data.py Generate synthetic_training_data rows
+│   ├── market_data.py       Shared OHLC + breach detection
+│   ├── news_v2.py           Junk filter + financial keyword overrides
+│   ├── holiday_calendar.py  NSE holidays (update yearly)
+│   ├── telegram_alerts.py   Helper for Telegram messages
+│   ├── risk.py              ★ v8: position sizing primitives
+│   └── portfolio.py         ★ v8: shared paper-portfolio queries
+├── dashboard/app.py         Streamlit dashboard
+├── supabase_setup.sql       Canonical schema (single install)
+├── supabase_migrations/     Numbered upgrade migrations
+│   └── 001_v7_to_v8.sql
 ├── requirements.txt
+├── CHANGELOG.md
 └── README.md
 ```
 
@@ -139,23 +170,21 @@ stock-agent/
 
 ## Troubleshooting
 
-**Agent failed in GitHub Actions?**
-- Check the Actions log for errors
-- Most common: a ticker returned no data from Yahoo Finance (safe to ignore)
-- Run it again manually via Actions → "Run workflow"
-
-**Dashboard shows "No signals"?**
-- The agent may not have run yet today (it runs at 7 AM IST)
-- Trigger a manual run from GitHub Actions
-
-**Live prices not loading in portfolio?**
-- Yahoo Finance has occasional rate limits — refresh after a minute
+| Symptom | Likely Cause |
+|---|---|
+| GH Action: "ticker returned no data" | Yahoo rate-limited a few tickers — the rest still complete. Safe to ignore. |
+| Dashboard: "No signals today" | Agent may not have run. Trigger manually via Actions. |
+| Dashboard: "Live unavailable" on a position | yfinance failed; refresh after a minute. P&L shown as "—" rather than misleading the user with buy_price. |
+| Phase 3 model "AUC 0.55X" | Likely too few rows or VIX coverage <5 %. `score_model.py` now drops near-empty features automatically and reports coverage in the training log. |
+| Champion params look stale | Optimizer is intentionally disabled; manually trigger `Weekly Parameter Optimization` after deploying Phase 3 LGBM. |
+| `synthetic_training_data` table missing | Run `supabase_migrations/001_v7_to_v8.sql` (creates the table if missing). |
 
 ---
 
 ## ⚠️ Disclaimer
 
-This tool is for educational and paper trading purposes only.
-It is not financial advice. Never invest more than you can afford to lose.
-Always cross-check signals with your own research.
-Start with paper trading for at least 4–6 weeks before using real money.
+Educational and paper-trading use only. **Not financial advice.** This
+agent backtests well in some market regimes and badly in others; past
+performance is not predictive. Never invest more than you can afford to
+lose. Always cross-check signals with your own research and start with
+paper trading for at least 4–6 weeks before using real capital.
