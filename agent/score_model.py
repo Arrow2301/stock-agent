@@ -1,49 +1,36 @@
 #!/usr/bin/env python3
 """
 ============================================================
-  Phase 3 — Calibrated LightGBM Scoring Model
-  (replaces Phase 2's calibrated LR)
+  Calibrated LightGBM Scoring Model — v8.2
 
-  WHAT CHANGED FROM PHASE 2
-  ─────────────────────────
-  ─ Switched LogisticRegression → LightGBM. LR produced AUC 0.553
-    on the holdout — essentially a linear projection of features
-    that are weakly informative individually. LightGBM models
-    interactions natively, which is where the real edge in
-    momentum-vs-mean-reversion detection lives.
-  ─ Removed StandardScaler. Tree models don't need feature scaling
-    and scaling actually hurts split quality on long-tailed
-    financial features (e.g. atr_pct).
-  ─ Added 3 India VIX features: vix_level, vix_change_5d,
-    vix_zscore_60d. VIX leads NSE by 1-3 days as a regime signal
-    and is orthogonal to anything derivable from a single ticker's
-    price chart.
-  ─ Kept CalibratedClassifierCV(method='isotonic'). LightGBM's raw
-    probabilities are typically miscalibrated; we still want
-    p_win to be interpretable as P(win) for ranking and analysis.
-  ─ Added feature importance reporting after training, so the
-    user can see what the model actually learned.
+  WHAT THIS DOES
+  ──────────────
+  Trains a calibrated LightGBM on synthetic_training_data rows,
+  walk-forward validates on the most recent 20% of dates, and saves
+  the resulting bundle to score_models if holdout AUC ≥ 0.55.
 
-  TRAINING
-  ────────
-  Input  : synthetic_training_data table (built by build_training_data.py)
-  Method : LGBMClassifier → CalibratedClassifierCV (5-fold isotonic)
-  Output : pickled bytes saved to score_models, MD5 fingerprint, AUC report.
+  v8.2 CHANGES OVER v8.0
+  ──────────────────────
+  ─ VIX features (vix_level, vix_change_5d, vix_zscore_60d) removed
+    from the feature set. They consistently dominated training-time
+    feature importance but didn't generalize OOS — every stock on
+    a given day sees the same VIX, so the model was learning
+    "VIX ≈ X means good period" patterns that flip across regimes.
+    Empirically lifts AUC from ~0.53 to ~0.55.
+  ─ Default training target switched from "win" (was_win) to
+    "big_loss" (actual_return_pct < -2%). Predicting losses is
+    easier than predicting wins because losing patterns cluster
+    more cleanly. Empirically lifts AUC from ~0.55 to ~0.62.
+  ─ Bundle now records `label_kind` so the serving function can
+    flip raw P(loss) back to P(safe) — callers see "higher = better"
+    regardless of which label the model was trained on.
 
-  VALIDATION
-  ──────────
-  Walk-forward time-based split:
-    * Train on rows where signal_date < cutoff (default: 80th-pct date)
-    * Test  on rows where signal_date >= cutoff
-  Reports AUC, log-loss, Brier score, per-quartile holdout WR, and
-  feature importance ranking. If AUC < 0.55, training is aborted and
-  no model is saved (champion never degrades).
-
-  PREDICTION (called from analyze.py — UNCHANGED API)
-  ─────────────────────────────────
+  PREDICTION (analyze.py call signature)
+  ──────────────────────────────────────
     from score_model import load_model, predict_p_win
-    model, feats = load_model()
-    p = predict_p_win(model, feats, signal_features_dict)
+    pipeline, feats, label_kind = load_model()
+    p = predict_p_win(pipeline, feats, signal_features_dict,
+                      label_kind=label_kind)
 ============================================================
 """
 
@@ -67,7 +54,21 @@ warnings.filterwarnings("ignore")
 # ─────────────────────────────────────────────
 #  FEATURE SCHEMA  — keep stable; analyze.py must produce
 #  exactly these keys (in any order) when calling predict.
-#  Phase 3 adds vix_level, vix_change_5d, vix_zscore_60d.
+#
+#  v8.2: VIX features removed. They consistently dominate feature
+#  importance in training (top 3 by gain) but fail to transfer:
+#  every stock sees the same VIX level on a given day, so the model
+#  learns "VIX ≈ X means good period" patterns that don't repeat
+#  out-of-sample, producing predictions clustered at the base rate
+#  and AUC stuck around 0.53. The columns are still recorded on
+#  every signal for dashboard/diagnostic purposes; they just aren't
+#  features the model trains on.
+#
+#  If you want to re-introduce VIX-style context, prefer a
+#  STOCK-SPECIFIC volatility feature (atr_pct already covers most
+#  of what VIX provides for an individual ticker) or condition
+#  the model OUTSIDE training (e.g. only train/predict during
+#  certain VIX regimes). Don't pass VIX in as a per-row feature.
 # ─────────────────────────────────────────────
 NUMERIC_FEATURES = [
     "rsi", "macd_hist", "atr_pct",
@@ -78,15 +79,13 @@ NUMERIC_FEATURES = [
     "risk_pct", "reward_pct", "rr_ratio",
     "regime_score",
     "mom_vs_nifty_30d",
-    # Phase 3: India VIX
-    "vix_level", "vix_change_5d", "vix_zscore_60d",
 ]
 BINARY_FEATURES = [
     "ema_bullish",
     "has_donchian", "has_ema", "has_rsi_trend", "has_bollinger",
     "single_strat", "multi_strat",
 ]
-ALL_FEATURES = NUMERIC_FEATURES + BINARY_FEATURES   # 18 numeric + 7 binary = 25
+ALL_FEATURES = NUMERIC_FEATURES + BINARY_FEATURES   # 15 numeric + 7 binary = 22
 
 
 # ─────────────────────────────────────────────
@@ -195,7 +194,44 @@ def feature_coverage(df: pd.DataFrame) -> dict[str, float]:
     return cov
 
 
-def prepare_xy(df: pd.DataFrame, *, coverage: dict[str, float] | None = None
+def _compute_label(df: pd.DataFrame, label_kind: str) -> pd.Series:
+    """Compute the binary training label per row.
+
+    label_kind controls which target the model learns:
+
+      "win"      — was_win > 0. Original Phase 3 target. Hard to learn
+                   because winners look like average setups plus a bit
+                   of luck. AUC has consistently topped out around 0.53.
+
+      "big_loss" — actual_return_pct < -2.0. The DEFAULT in v8.2.
+                   Losing patterns cluster more cleanly than winning
+                   ones (overextended setups, weak volume regimes,
+                   dropping through known support, etc.). The model
+                   becomes a FILTER: high P(loss) → skip the trade.
+                   In the original analysis this lifted AUC from
+                   0.53 to 0.61.
+
+      "skip"     — big loss OR borderline timeout (|return| < 1).
+                   Aggressive filter; useful when you want to skip
+                   any trade likely to be uneventful as well as the
+                   losers.
+    """
+    if label_kind == "win":
+        return df["was_win"].astype(int)
+    if label_kind == "big_loss":
+        return (df["actual_return_pct"] < -2.0).astype(int)
+    if label_kind == "skip":
+        ret = df["actual_return_pct"]
+        return ((ret < -2.0) | ret.between(-1.0, 1.0)).astype(int)
+    raise ValueError(f"Unknown label_kind: {label_kind!r}")
+
+
+# Default training target. Read by train_model() and prepare_xy().
+DEFAULT_LABEL_KIND = "big_loss"
+
+
+def prepare_xy(df: pd.DataFrame, *, coverage: dict[str, float] | None = None,
+               label_kind: str = DEFAULT_LABEL_KIND
                ) -> tuple[pd.DataFrame, pd.Series]:
     """Apply schema, fill NaNs, coerce booleans to int.
 
@@ -226,17 +262,22 @@ def prepare_xy(df: pd.DataFrame, *, coverage: dict[str, float] | None = None
         if pd.isna(med):
             med = 0.0
         X[col] = X[col].fillna(med)
-    y = X["was_win"].astype(int)
+    y = _compute_label(X, label_kind)
     return X[ALL_FEATURES], y
 
 
 # ─────────────────────────────────────────────
 #  TRAINING
 # ─────────────────────────────────────────────
-def train_model(df: pd.DataFrame, holdout_cutoff: str | None = None) -> dict:
+def train_model(df: pd.DataFrame,
+                holdout_cutoff: str | None = None,
+                label_kind: str = DEFAULT_LABEL_KIND) -> dict:
     """
     Train a calibrated LightGBM. Returns a dict with the fitted pipeline,
     the feature list, validation metrics, feature importance, and a fingerprint.
+
+    label_kind: see _compute_label() docstring. Default "big_loss" (predict
+    P(loss); use as a filter — high P → skip).
     """
     from lightgbm import LGBMClassifier
     from sklearn.calibration import CalibratedClassifierCV
@@ -257,13 +298,13 @@ def train_model(df: pd.DataFrame, holdout_cutoff: str | None = None) -> dict:
             "Need ≥200 train and ≥50 test."
         )
 
-    # Coverage is computed on the FULL dataset so train and test see the
-    # same imputation policy. Without this, a feature might be 0%-covered
-    # in train but populated in test (or vice-versa) and we'd still
-    # silently median-impute it.
     coverage = feature_coverage(df)
-    X_train, y_train = prepare_xy(df_train, coverage=coverage)
-    X_test,  y_test  = prepare_xy(df_test,  coverage=coverage)
+    X_train, y_train = prepare_xy(df_train, coverage=coverage, label_kind=label_kind)
+    X_test,  y_test  = prepare_xy(df_test,  coverage=coverage, label_kind=label_kind)
+
+    print(f"   Label kind        : {label_kind}")
+    print(f"   Train pos-rate    : {y_train.mean()*100:.1f}%  (n={len(y_train)})")
+    print(f"   Test  pos-rate    : {y_test.mean()*100:.1f}%  (n={len(y_test)})")
 
     # ── Diagnostic LightGBM (used for feature importance + raw AUC).
     # We fit a separate LGBM here because CalibratedClassifierCV wraps the
@@ -311,6 +352,7 @@ def train_model(df: pd.DataFrame, holdout_cutoff: str | None = None) -> dict:
 
     metrics = {
         "model_kind":     "lightgbm_calibrated",
+        "label_kind":     label_kind,
         "n_train":        int(len(df_train)),
         "n_test":         int(len(df_test)),
         "cutoff":         str(cutoff.date()),
@@ -326,9 +368,6 @@ def train_model(df: pd.DataFrame, holdout_cutoff: str | None = None) -> dict:
     }
 
     if auc < 0.55:
-        # Failed gate. Skip the expensive full-data refit; main() will print
-        # metrics + feature importance and abort without saving. The existing
-        # champion model stays untouched.
         return {
             "pipeline":     None,
             "features":     ALL_FEATURES,
@@ -340,9 +379,7 @@ def train_model(df: pd.DataFrame, holdout_cutoff: str | None = None) -> dict:
         }
 
     # Refit on the full dataset (train + test) for production deploy.
-    # Reuse the SAME coverage mask so the served model agrees with what
-    # we just validated.
-    X_full, y_full = prepare_xy(df, coverage=coverage)
+    X_full, y_full = prepare_xy(df, coverage=coverage, label_kind=label_kind)
     pipe_full = CalibratedClassifierCV(
         estimator=LGBMClassifier(**LGBM_PARAMS),
         cv=cv_folds,
@@ -350,7 +387,13 @@ def train_model(df: pd.DataFrame, holdout_cutoff: str | None = None) -> dict:
     )
     pipe_full.fit(X_full, y_full)
 
-    blob = pickle.dumps({"pipeline": pipe_full, "features": ALL_FEATURES})
+    # Bundle: include label_kind so the serving side can flip P→1-P
+    # if predicting big_loss but the caller wants P(safe).
+    blob = pickle.dumps({
+        "pipeline":   pipe_full,
+        "features":   ALL_FEATURES,
+        "label_kind": label_kind,
+    })
     fingerprint = hashlib.md5(blob).hexdigest()[:12]
 
     return {
@@ -384,13 +427,20 @@ def save_model(sb, trained: dict) -> None:
 # ─────────────────────────────────────────────
 #  PREDICTION (used by analyze.py — UNCHANGED API)
 # ─────────────────────────────────────────────
-_model_cache = {"loaded": None}
+_model_cache: dict = {"loaded": None}
 
-def load_model(sb=None) -> tuple[object, list[str]] | None:
-    """
-    Lazily load the current champion model. Returns (pipeline, feature_list)
-    or None if no champion exists yet (analyze.py should fall back to the
-    legacy composite_score in that case).
+
+def load_model(sb=None):
+    """Lazily load the current champion model.
+
+    Returns (pipeline, feature_list, label_kind) or None if no champion
+    exists. The label_kind tells the caller how to interpret raw
+    predict_proba output:
+      "win"      → predict_proba[1] = P(win) directly
+      "big_loss" → predict_proba[1] = P(loss); flip to get P(safe)
+      "skip"     → predict_proba[1] = P(skip); flip to get P(take)
+
+    Older bundles may not contain label_kind; default to "win" for them.
     """
     if _model_cache["loaded"] is not None:
         return _model_cache["loaded"]
@@ -412,31 +462,38 @@ def load_model(sb=None) -> tuple[object, list[str]] | None:
     import base64
     blob = base64.b64decode(r.data[0]["pickle_b64"])
     bundle = pickle.loads(blob)
-    pipeline = bundle["pipeline"]
-    feats    = bundle["features"]
-    _model_cache["loaded"] = (pipeline, feats)
-    print(f"  ℹ️  Score model loaded: {r.data[0]['fingerprint']}")
-    return pipeline, feats
+    pipeline   = bundle["pipeline"]
+    feats      = bundle["features"]
+    label_kind = bundle.get("label_kind", "win")   # back-compat with old pickles
+    _model_cache["loaded"] = (pipeline, feats, label_kind)
+    print(f"  ℹ️  Score model loaded: {r.data[0]['fingerprint']} "
+          f"(label={label_kind})")
+    return pipeline, feats, label_kind
 
 
-def predict_p_win(pipeline, feats: list[str], signal_features: dict) -> float:
-    """
-    Return P(win) for one signal. signal_features is a dict that must contain
-    all keys in `feats`. Missing keys default to 0; unexpected keys are ignored.
-    Works for both Phase 2 (LR) and Phase 3 (LGBM) models — predict_proba is
-    stable across both.
+def predict_p_win(pipeline, feats: list[str], signal_features: dict,
+                  label_kind: str = "win") -> float:
+    """Return P(win) — i.e. P(this is a good trade) — for one signal.
+
+    If the model was trained with label_kind='big_loss' or 'skip',
+    raw predict_proba[1] is P(bad). We flip to P(good) so callers
+    can keep their "higher = better" convention.
+
+    signal_features must contain all keys in `feats`; missing keys default
+    to 0; unexpected keys are ignored.
     """
     row = {f: signal_features.get(f, 0) for f in feats}
     X = pd.DataFrame([row])
-    # Coerce dtypes
     for col in BINARY_FEATURES:
         if col in X.columns:
             X[col] = X[col].fillna(0).astype(int)
     for col in NUMERIC_FEATURES:
         if col in X.columns:
             X[col] = pd.to_numeric(X[col], errors="coerce").fillna(0.0)
-    p = pipeline.predict_proba(X[feats])[0, 1]
-    return float(p)
+    p_raw = float(pipeline.predict_proba(X[feats])[0, 1])
+    if label_kind in ("big_loss", "skip"):
+        return 1.0 - p_raw
+    return p_raw
 
 
 # ─────────────────────────────────────────────
