@@ -47,10 +47,21 @@ sb = get_supabase()
 def check_password():
     if st.session_state.get("authenticated"):
         return True
+    expected = st.secrets.get("DASHBOARD_PASSWORD")
+    if not expected:
+        # REVIEW A5: never fall back to a hardcoded password. If the
+        # secret isn't set, refuse to load the dashboard at all rather
+        # than silently expose it.
+        st.error(
+            "⚠️ DASHBOARD_PASSWORD is not set in Streamlit secrets. "
+            "Add a value to .streamlit/secrets.toml (or the deployment "
+            "environment) and reload."
+        )
+        st.stop()
     st.title("🇮🇳 Indian Stock Agent")
     pwd = st.text_input("Password", type="password")
     if st.button("Login"):
-        if pwd == st.secrets.get("DASHBOARD_PASSWORD", "stockagent123"):
+        if pwd == expected:
             st.session_state.authenticated = True
             st.rerun()
         else:
@@ -887,8 +898,32 @@ if page == "📊 Today's Signals":
     # ── Paper trade form
     st.subheader("📝 Paper Trade")
     if sel.get("action") == "BUY":
+        # v8: pre-fill qty using the agent's suggested_qty if available.
+        # The agent computes this with a 1% account-risk fixed-fractional
+        # rule + regime + drawdown + sector caps. The user can still edit.
+        sug_qty = safe_int(sel.get("suggested_qty"), 0)
+        size_blocked = bool(sel.get("size_blocked", False))
+        try:
+            size_reasons = json.loads(sel.get("size_reasons") or "[]")
+        except Exception:
+            size_reasons = []
+        default_qty = sug_qty if sug_qty > 0 else 10
+        if size_blocked:
+            st.warning("⚠️ Position-sizing gates blocked this trade — review reasons below.")
+        if size_reasons:
+            with st.expander("📐 Sizing rationale", expanded=False):
+                for r in size_reasons:
+                    st.write(f"• {r}")
+
         pb1, pb2, pb3, pb4 = st.columns(4)
-        qty   = pb1.number_input("Qty", min_value=1, value=10, key=f"qty_{sel.ticker}")
+        qty   = pb1.number_input(
+            "Qty",
+            min_value=1,
+            value=max(1, default_qty),
+            key=f"qty_{sel.ticker}",
+            help=("Suggested by agent — based on 1% account risk, regime, "
+                  "drawdown brake, and sector cap. Edit if you disagree."),
+        )
         price = pb2.number_input("Price (₹)", value=safe_float(sel.get("price"), 0.0),
                                   key=f"px_{sel.ticker}")
         sl_in = pb3.number_input("Stop Loss (₹)", value=safe_float(sel.get("stop_loss"), 0.0),
@@ -927,6 +962,39 @@ elif page == "💼 My Paper Portfolio":
     st.subheader("📂 Open Positions")
     if alerts:
         st.warning(f"⚠️ {len(alerts)} position(s) need attention — see alerts above!")
+
+    # v8: EXIT-on-holding banner. If today's recommendation set has any
+    # action='EXIT' rows that match an open ticker, surface them prominently.
+    # Mirrors the Telegram alert from analyze.py.
+    if not open_pos.empty:
+        held_set = set(open_pos["ticker"].astype(str).tolist())
+        exit_today = []
+        try:
+            today_str = date.today().strftime("%Y-%m-%d")
+            er = (sb.table("recommendations")
+                  .select("ticker, composite_score, active_strategies, news_headline")
+                  .eq("date", today_str)
+                  .eq("action", "EXIT")
+                  .execute())
+            for r in (er.data or []):
+                if r.get("ticker") in held_set:
+                    exit_today.append(r)
+        except Exception:
+            pass
+        if exit_today:
+            with st.container():
+                st.error(
+                    f"🔴 **EXIT signal today on {len(exit_today)} position"
+                    f"{'s' if len(exit_today) > 1 else ''} you currently hold.** "
+                    "Review and consider closing manually."
+                )
+                for r in exit_today:
+                    st.write(
+                        f"• **{r['ticker']}** — composite "
+                        f"{safe_float(r.get('composite_score'),0):.0f}/100 "
+                        f"({r.get('active_strategies') or '—'})"
+                    )
+
     if open_pos.empty:
         st.info("No open positions. Go to 'Today's Signals' to paper buy.")
     else:
@@ -935,8 +1003,14 @@ elif page == "💼 My Paper Portfolio":
             if lp > 0:
                 pnl_pct = (lp - row.buy_price) / row.buy_price * 100 if row.buy_price else 0
                 pnl_inr = (lp - row.buy_price) * row.quantity
+                live_unavailable = False
             else:
-                lp = row.buy_price; pnl_pct = pnl_inr = 0
+                # yfinance failed. Don't pretend buy_price is live — the
+                # user will think the position is flat. Mark unavailable
+                # and zero the P&L so the UI doesn't lie about the position.
+                lp = 0.0
+                pnl_pct = pnl_inr = 0
+                live_unavailable = True
             sl  = safe_float(row.get("entry_stop_loss"), 0)
             tgt = safe_float(row.get("entry_target"), 0)
 
@@ -946,7 +1020,7 @@ elif page == "💼 My Paper Portfolio":
             if prior_flag in ("sl_hit", "target_hit"):
                 breach = {
                     "type":        prior_flag,
-                    "fill_price":  safe_float(row.get("breach_price"), lp),
+                    "fill_price":  safe_float(row.get("breach_price"), lp if lp > 0 else row.buy_price),
                     "breach_date": row.get("breach_date"),
                     "gapped":      False,
                 }
@@ -962,11 +1036,15 @@ elif page == "💼 My Paper Portfolio":
             sl_hit  = bool(breach and breach["type"] == "sl_hit")
             tgt_hit = bool(breach and breach["type"] == "target_hit")
             icon    = "🚨" if sl_hit else ("🎯" if tgt_hit else ("🟢" if pnl_pct >= 0 else "🔴"))
+            live_str = "Live unavailable" if live_unavailable else f"Live ₹{lp:,.2f}"
             with st.expander(
                 f"{icon} **{row.ticker}** | {safe_int(row.quantity)} shares | "
-                f"Buy ₹{safe_float(row.buy_price):,.2f} → Live ₹{lp:,.2f} | "
+                f"Buy ₹{safe_float(row.buy_price):,.2f} → {live_str} | "
                 f"P&L {pnl_pct:+.2f}%", expanded=sl_hit or tgt_hit
             ):
+                if live_unavailable:
+                    st.warning("⚠️ Live price could not be fetched from yfinance. "
+                               "P&L shown as 0 until next refresh.")
                 if sl_hit:
                     bd  = breach.get("breach_date") or "today"
                     gap = " (gap-down)" if breach.get("gapped") else ""
@@ -982,12 +1060,12 @@ elif page == "💼 My Paper Portfolio":
                 pc1, pc2, pc3 = st.columns(3)
                 pc1.metric("Buy Price",  fmt_inr(row.buy_price))
                 pc1.metric("Buy Date",   str(row.buy_date))
-                pc2.metric("Live Price", fmt_inr(lp))
+                pc2.metric("Live Price", "—" if live_unavailable else fmt_inr(lp))
                 pc2.metric("Stop Loss",  fmt_inr(sl) if sl else "Not set")
                 pc2.metric("Target",     fmt_inr(tgt) if tgt else "Not set")
-                pc3.metric("P&L %",  fmt_pct(pnl_pct))
-                pc3.metric("P&L ₹",  f"₹{pnl_inr:+,.0f}")
-                if sl > 0:
+                pc3.metric("P&L %",  "—" if live_unavailable else fmt_pct(pnl_pct))
+                pc3.metric("P&L ₹",  "—" if live_unavailable else f"₹{pnl_inr:+,.0f}")
+                if sl > 0 and not live_unavailable and lp > 0:
                     sl_dist = (lp - sl) / lp * 100
                     pc3.metric("Dist to SL", f"{sl_dist:.1f}%",
                                 delta_color="inverse" if sl_dist < 2 else "normal")
