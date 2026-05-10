@@ -1,11 +1,22 @@
 #!/usr/bin/env python3
 """
 ============================================================
-  Phase 2 — Synthetic Training Data Generator
+  Phase 3 — Synthetic Training Data Generator
+  (adds India VIX features over Phase 2)
 
   Runs v7 strategy code backwards through 5 years of historical
   NSE data to produce ~10,000-30,000 labelled (signal, outcome)
-  examples for the calibrated LR scoring model.
+  examples for the calibrated LightGBM scoring model.
+
+  WHAT CHANGED FROM PHASE 2
+  ─────────────────────────
+  ─ Fetches India VIX history (^INDIAVIX) once at start of run
+  ─ Computes 3 VIX features point-in-time for every signal:
+      • vix_level       — raw closing VIX on signal_date
+      • vix_change_5d   — VIX(today) - VIX(5 days ago); rising VIX
+                          = stress increasing, regime transition
+      • vix_zscore_60d  — current level vs 60-day mean/std; high
+                          z-score = unusual stress relative to recent norm
 
   WHY THIS EXISTS
   ───────────────
@@ -116,6 +127,78 @@ def compute_regime_series(nifty_df: pd.DataFrame) -> pd.Series:
 
 
 REGIME_SCORE = {"BULLISH": 1.0, "NEUTRAL": 0.5, "BEARISH": 0.0}
+
+
+# ─────────────────────────────────────────────
+#  INDIA VIX (Phase 3) — fetch once, query point-in-time
+# ─────────────────────────────────────────────
+VIX_LOOKBACK_BUFFER = 90    # extra calendar days before start_date so we have
+                            # enough history to compute the 60-day z-score on
+                            # the very first signal in the window
+
+def fetch_vix_history(start: str, end: str) -> pd.DataFrame | None:
+    """
+    Fetch ^INDIAVIX (NSE India VIX) for the full window plus a lookback
+    buffer. Returns a DataFrame indexed by date with a Close column,
+    or None on failure (training proceeds with vix=NaN, model can still fit).
+    """
+    try:
+        # Pad start back ~90 days so vix_zscore_60d works at the earliest signal
+        pad_start = (pd.Timestamp(start) - pd.Timedelta(days=VIX_LOOKBACK_BUFFER)).strftime("%Y-%m-%d")
+        df = yf.download(
+            "^INDIAVIX",
+            start=pad_start, end=end,
+            progress=False, auto_adjust=True, threads=False,
+        )
+        if df is None or df.empty:
+            return None
+        df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+        df = df.dropna(subset=["Close"])
+        return df[["Close"]].rename(columns={"Close": "vix"}) if len(df) else None
+    except Exception:
+        return None
+
+
+def vix_features_at(vix_df: pd.DataFrame | None, asof_ts: pd.Timestamp) -> dict:
+    """
+    Compute the 3 VIX features as of `asof_ts` using only data <= asof_ts.
+    Returns dict with vix_level / vix_change_5d / vix_zscore_60d, any of
+    which can be None when there isn't enough history.
+    """
+    none_out = {"vix_level": None, "vix_change_5d": None, "vix_zscore_60d": None}
+    if vix_df is None or vix_df.empty:
+        return none_out
+    # Strict point-in-time: only rows up to and including asof_ts
+    pit = vix_df[vix_df.index <= asof_ts]
+    if pit.empty:
+        return none_out
+    series = pit["vix"].dropna()
+    if series.empty:
+        return none_out
+
+    level = float(series.iloc[-1])
+    if not math.isfinite(level):
+        return none_out
+
+    change_5d = None
+    if len(series) >= 6:
+        prev = float(series.iloc[-6])
+        if math.isfinite(prev):
+            change_5d = round(level - prev, 3)
+
+    zscore_60d = None
+    if len(series) >= 60:
+        window = series.iloc[-60:]
+        mu = float(window.mean())
+        sd = float(window.std(ddof=0))
+        if sd > 1e-9 and math.isfinite(mu) and math.isfinite(sd):
+            zscore_60d = round((level - mu) / sd, 3)
+
+    return {
+        "vix_level":      round(level, 3),
+        "vix_change_5d":  change_5d,
+        "vix_zscore_60d": zscore_60d,
+    }
 
 
 # ─────────────────────────────────────────────
@@ -360,6 +443,7 @@ def process_ticker(
     df: pd.DataFrame,
     nifty_df: pd.DataFrame,
     regime_series: pd.Series,
+    vix_df: pd.DataFrame | None,    # Phase 3 — None if VIX fetch failed
     p: dict,
 ) -> list[dict]:
     """
@@ -411,6 +495,9 @@ def process_ticker(
         if not feats:
             continue
 
+        # Phase 3: VIX features point-in-time at day i
+        vix_feats = vix_features_at(vix_df, df.index[i])
+
         entry_price = feats["price"]
         sl  = feats.get("risk_pct")
         tgt = feats.get("reward_pct")
@@ -436,6 +523,7 @@ def process_ticker(
             "signal_date":  signal_date,
             "gated_out":    gated_out,
             **feats,
+            **vix_feats,        # Phase 3: vix_level, vix_change_5d, vix_zscore_60d
             **outcome,
         })
 
@@ -509,7 +597,17 @@ def main():
         print("   ❌ Nifty fetch failed; aborting.")
         return
     regime_series = compute_regime_series(nifty_df)
-    print(f"   Nifty bars: {len(nifty_df)} | regime samples: {len(regime_series)}\n")
+    print(f"   Nifty bars: {len(nifty_df)} | regime samples: {len(regime_series)}")
+
+    # ── Phase 3: Fetch India VIX once. If this fails, training proceeds with
+    # vix_* = None and the model uses the median fallback in prepare_xy. We
+    # don't abort because VIX is additive context, not a hard requirement.
+    print("   Fetching India VIX (^INDIAVIX)...")
+    vix_df = fetch_vix_history(args.start, args.end)
+    if vix_df is None or vix_df.empty:
+        print(f"   ⚠️  VIX fetch failed; rows will have null VIX features.\n")
+    else:
+        print(f"   VIX bars: {len(vix_df)}  ({vix_df.index.min().date()} → {vix_df.index.max().date()})\n")
 
     P = DEFAULT_PARAMS
     grand_total = 0
@@ -521,7 +619,7 @@ def main():
             skipped += 1
             print(f"   {n:>3}/{len(tickers)}  {ticker:<14}  ⚠️  insufficient data")
             continue
-        rows = process_ticker(ticker, df, nifty_df, regime_series, P)
+        rows = process_ticker(ticker, df, nifty_df, regime_series, vix_df, P)
         write_rows(rows, sb=sb, csv_path=args.csv)
         grand_total += len(rows)
         print(f"   {n:>3}/{len(tickers)}  {ticker:<14}  bars={len(df):4}  signals={len(rows):4}  "

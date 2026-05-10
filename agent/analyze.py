@@ -1,34 +1,32 @@
 #!/usr/bin/env python3
 """
 ============================================================
-  Indian Stock Market Analysis Agent  —  v7 + Phase 2
+  Indian Stock Market Analysis Agent  —  v7 + Phase 3
 
-  Phase 2 additions:
-  ─ Calibrated LR scorer (agent/score_model.py) loaded once at
-    startup. Each BUY signal gets a P(win) prediction stored on
-    the recommendation row. The model AUGMENTS composite_score;
-    it does not replace it. The leaderboard still sorts by
-    final_score until Patch 6 is applied (after 2 weeks of A/B).
+  Phase 3 additions (over Phase 2):
+  ─ India VIX features added to the model input. Three values
+    (vix_level, vix_change_5d, vix_zscore_60d) are fetched once
+    per run and attached to every BUY signal's feature vector.
+    VIX is forward-looking and orthogonal to the price chart;
+    expect it to be among the top features in the LightGBM
+    importance ranking.
+  ─ The score model itself is now LightGBM (calibrated). The
+    code path here is unchanged — load_model() / predict_p_win()
+    have a stable API regardless of the underlying estimator.
+
+  Phase 2 additions (carried forward):
+  ─ Calibrated scorer loaded once at startup. Each BUY signal
+    gets a P(win) prediction stored on the recommendation row.
+    p_win augments composite_score; it does not replace it.
   ─ context() extended with: change_30d, pct_from_52w_high,
-    pct_from_52w_low, atr_pct (all needed as model features).
-  ─ momentum_vs_nifty_30d() helper added — the strongest
-    relative-strength feature in the LR.
+    pct_from_52w_low, atr_pct.
+  ─ momentum_vs_nifty_30d() helper.
 
-  v7 changes (carried forward):
-  ─ Strategy roster reduced 6 → 4 (RSI+MACD, Volume Breakout
-    removed based on production data analysis).
-  ─ Supertrend computation removed.
-  ─ Hard gates: BUY rejected if multi-strat fires or BEARISH regime.
-  ─ News sentiment via agent/news_v2.py (junk filter + financial
-    keyword overrides for "profit booking" etc.).
-  ─ Holiday-aware: workflow skips on NSE holidays.
-
-  Carried over from v6:
-  ─ Fundamental screening (P/E, D/E, ROE, revenue growth)
-  ─ Signal streak tracking
-  ─ Market breadth metric in agent_meta
-  ─ Telegram morning alert
-  ─ trade_returns list in backtest JSON for dashboard
+  v7 (carried forward):
+  ─ 4-strategy roster (Donchian, EMA, RSI Trend Shift, Bollinger).
+  ─ Hard gates: BUY rejected if multi-strat or BEARISH regime.
+  ─ news_v2: junk filter + financial keyword overrides.
+  ─ Holiday-aware workflow.
 ============================================================
 """
 
@@ -50,9 +48,9 @@ from supabase import create_client, Client
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from news_v2 import fetch_news_sentiment   # noqa: E402
 
-# Phase 2: calibrated LR scorer. Loaded lazily; if no champion model
-# exists in Supabase yet, _SCORE_MODEL is None and the agent falls
-# back to legacy composite_score-only behaviour. No-op if unavailable.
+# Phase 2: calibrated scorer (LR in Phase 2, LightGBM in Phase 3 — same API).
+# Loaded lazily; if no champion model exists in Supabase yet, _SCORE_MODEL
+# is None and the agent falls back to legacy composite_score-only behaviour.
 try:
     from score_model import load_model, predict_p_win
     _SCORE_MODEL = load_model()           # (pipeline, feature_list) or None
@@ -1108,13 +1106,74 @@ def momentum_vs_nifty_30d(df, benchmark_df, days: int = 30):
         return None
 
 
+# ─────────────────────────────────────────────
+#  PHASE 3 — INDIA VIX FEATURES (live)
+#  Fetched once per daily run. If yfinance returns nothing (rare,
+#  but it's happened on holidays and during yfinance outages), all
+#  three features fall back to None — the model handles missing
+#  values via median-imputation in score_model.predict_p_win.
+# ─────────────────────────────────────────────
+
+def fetch_vix_features_today():
+    """
+    Fetch ^INDIAVIX and compute (vix_level, vix_change_5d, vix_zscore_60d)
+    using the most recent ~90 trading days. All three features are computed
+    point-in-time using the latest available close ≤ today.
+
+    Returns dict with three keys (any can be None on partial data / fetch
+    failure). Never raises — failures degrade gracefully.
+    """
+    none_out = {"vix_level": None, "vix_change_5d": None, "vix_zscore_60d": None}
+    try:
+        df = yf.download(
+            "^INDIAVIX",
+            period="6mo", progress=False, auto_adjust=True, threads=False,
+        )
+        if df is None or df.empty:
+            return none_out
+        df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+        series = df["Close"].dropna()
+        if series.empty:
+            return none_out
+
+        level = float(series.iloc[-1])
+        if not math.isfinite(level):
+            return none_out
+
+        change_5d = None
+        if len(series) >= 6:
+            prev = float(series.iloc[-6])
+            if math.isfinite(prev):
+                change_5d = round(level - prev, 3)
+
+        zscore_60d = None
+        if len(series) >= 60:
+            window = series.iloc[-60:]
+            mu = float(window.mean())
+            sd = float(window.std(ddof=0))
+            if sd > 1e-9 and math.isfinite(mu) and math.isfinite(sd):
+                zscore_60d = round((level - mu) / sd, 3)
+
+        return {
+            "vix_level":      round(level, 3),
+            "vix_change_5d":  change_5d,
+            "vix_zscore_60d": zscore_60d,
+        }
+    except Exception as e:
+        print(f"  ⚠️  VIX fetch failed: {e}")
+        return none_out
+
+
 def signal_features_for_model(ctx: dict, today_sigs: dict, regime_label: str,
-                              mom_vs_nifty_30d) -> dict:
+                              mom_vs_nifty_30d, vix_features: dict | None = None) -> dict:
     """
     Pack the v7 signal context into the dict shape score_model expects.
     Keys must match score_model.ALL_FEATURES exactly. Missing values
     default to neutral (0 or 0.5) so the model still produces a
     prediction even when data is sparse.
+
+    Phase 3: vix_features (dict or None) provides the three VIX values
+    fetched once per run by fetch_vix_features_today().
     """
     has_donchian   = int(today_sigs.get("Donchian",        0) ==  1)
     has_ema        = int(today_sigs.get("EMA Crossover",   0) ==  1)
@@ -1125,6 +1184,11 @@ def signal_features_for_model(ctx: dict, today_sigs: dict, regime_label: str,
     vol_now = ctx.get("volume", 0) or 0
     vol_avg = ctx.get("avg_volume", 0) or 0
     vol_ratio = round(vol_now / vol_avg, 3) if vol_avg > 0 else 1.0
+
+    vix = vix_features or {}
+    vix_level      = vix.get("vix_level")
+    vix_change_5d  = vix.get("vix_change_5d")
+    vix_zscore_60d = vix.get("vix_zscore_60d")
 
     return {
         "rsi":               ctx.get("rsi") if ctx.get("rsi") is not None else 50,
@@ -1142,6 +1206,11 @@ def signal_features_for_model(ctx: dict, today_sigs: dict, regime_label: str,
         "rr_ratio":          ctx.get("rr_ratio") if ctx.get("rr_ratio") is not None else 0,
         "regime_score":      _REGIME_SCORE_MAP.get(regime_label, 0.5),
         "mom_vs_nifty_30d":  mom_vs_nifty_30d if mom_vs_nifty_30d is not None else 0,
+        # Phase 3: VIX features. None → 0 fallback. Median imputation for
+        # training-time NaNs happens in score_model.prepare_xy.
+        "vix_level":         vix_level if vix_level is not None else 0,
+        "vix_change_5d":     vix_change_5d if vix_change_5d is not None else 0,
+        "vix_zscore_60d":    vix_zscore_60d if vix_zscore_60d is not None else 0,
         "ema_bullish":       int(bool(ctx.get("ema_bullish"))),
         "has_donchian":      has_donchian,
         "has_ema":           has_ema,
@@ -1208,6 +1277,19 @@ def run():
     print("   Loading NIFTY benchmark (^NSEI) for relative metrics...")
     benchmark_df = fetch_benchmark()
     print(f"   Benchmark bars: {len(benchmark_df)}")
+
+    # Phase 3: Fetch India VIX once. Used for vix_level, vix_change_5d,
+    # vix_zscore_60d on every BUY signal's feature vector. Failure is
+    # non-fatal — fetch_vix_features_today() returns None values and
+    # the model degrades gracefully via median imputation.
+    print("   Fetching India VIX (^INDIAVIX)...")
+    vix_features = fetch_vix_features_today()
+    if vix_features.get("vix_level") is not None:
+        print(f"   VIX level: {vix_features['vix_level']}  "
+              f"5d Δ: {vix_features.get('vix_change_5d')}  "
+              f"60d z: {vix_features.get('vix_zscore_60d')}")
+    else:
+        print(f"   ⚠️  VIX data unavailable — features will fall back to 0")
 
     # ── Pre-fetch signal streaks in one query
     print("   Loading signal streak history...")
@@ -1313,7 +1395,7 @@ def run():
             if _SCORE_MODEL is not None and action == "BUY":
                 pipeline, feats = _SCORE_MODEL
                 mom = momentum_vs_nifty_30d(df, benchmark_df)
-                sig_feats = signal_features_for_model(ctx, today_sigs, regime_label, mom)
+                sig_feats = signal_features_for_model(ctx, today_sigs, regime_label, mom, vix_features)
                 try:
                     p_win_score = round(predict_p_win(pipeline, feats, sig_feats), 4)
                 except Exception as e:
@@ -1400,6 +1482,11 @@ def run():
                 streak            = streak_today,
                 # Phase 2: predicted P(win) for BUYs (None for EXITs)
                 p_win             = p_win_score,
+                # Phase 3: VIX snapshot at signal time (same value across all
+                # rows of a given run, but denormalized for easy querying).
+                vix_level         = vix_features.get("vix_level"),
+                vix_change_5d     = vix_features.get("vix_change_5d"),
+                vix_zscore_60d    = vix_features.get("vix_zscore_60d"),
                 **ctx,
             )
 

@@ -1,28 +1,45 @@
 #!/usr/bin/env python3
 """
 ============================================================
-  Phase 2 — Calibrated LR Scoring Model
+  Phase 3 — Calibrated LightGBM Scoring Model
+  (replaces Phase 2's calibrated LR)
 
-  Replaces the hand-weighted composite_score with a model that
-  learns from outcomes: P(win) and E[return] given features.
+  WHAT CHANGED FROM PHASE 2
+  ─────────────────────────
+  ─ Switched LogisticRegression → LightGBM. LR produced AUC 0.553
+    on the holdout — essentially a linear projection of features
+    that are weakly informative individually. LightGBM models
+    interactions natively, which is where the real edge in
+    momentum-vs-mean-reversion detection lives.
+  ─ Removed StandardScaler. Tree models don't need feature scaling
+    and scaling actually hurts split quality on long-tailed
+    financial features (e.g. atr_pct).
+  ─ Added 3 India VIX features: vix_level, vix_change_5d,
+    vix_zscore_60d. VIX leads NSE by 1-3 days as a regime signal
+    and is orthogonal to anything derivable from a single ticker's
+    price chart.
+  ─ Kept CalibratedClassifierCV(method='isotonic'). LightGBM's raw
+    probabilities are typically miscalibrated; we still want
+    p_win to be interpretable as P(win) for ranking and analysis.
+  ─ Added feature importance reporting after training, so the
+    user can see what the model actually learned.
 
   TRAINING
   ────────
   Input  : synthetic_training_data table (built by build_training_data.py)
-  Method : sklearn StandardScaler → LogisticRegression → CalibratedClassifierCV (5-fold)
-  Output : pickled bytes saved to Supabase score_models table, plus an MD5
-           fingerprint and AUC report.
+  Method : LGBMClassifier → CalibratedClassifierCV (5-fold isotonic)
+  Output : pickled bytes saved to score_models, MD5 fingerprint, AUC report.
 
   VALIDATION
   ──────────
   Walk-forward time-based split:
-    * Train on rows where signal_date < cutoff (e.g. 2025-06-30)
+    * Train on rows where signal_date < cutoff (default: 80th-pct date)
     * Test  on rows where signal_date >= cutoff
-  Reports AUC, log-loss, calibration error, and per-quartile WR
-  on the holdout. If the model fails to beat random (AUC < 0.55),
-  training is aborted and no model is saved.
+  Reports AUC, log-loss, Brier score, per-quartile holdout WR, and
+  feature importance ranking. If AUC < 0.55, training is aborted and
+  no model is saved (champion never degrades).
 
-  PREDICTION (called from analyze.py)
+  PREDICTION (called from analyze.py — UNCHANGED API)
   ─────────────────────────────────
     from score_model import load_model, predict_p_win
     model, feats = load_model()
@@ -50,6 +67,7 @@ warnings.filterwarnings("ignore")
 # ─────────────────────────────────────────────
 #  FEATURE SCHEMA  — keep stable; analyze.py must produce
 #  exactly these keys (in any order) when calling predict.
+#  Phase 3 adds vix_level, vix_change_5d, vix_zscore_60d.
 # ─────────────────────────────────────────────
 NUMERIC_FEATURES = [
     "rsi", "macd_hist", "atr_pct",
@@ -60,13 +78,40 @@ NUMERIC_FEATURES = [
     "risk_pct", "reward_pct", "rr_ratio",
     "regime_score",
     "mom_vs_nifty_30d",
+    # Phase 3: India VIX
+    "vix_level", "vix_change_5d", "vix_zscore_60d",
 ]
 BINARY_FEATURES = [
     "ema_bullish",
     "has_donchian", "has_ema", "has_rsi_trend", "has_bollinger",
     "single_strat", "multi_strat",
 ]
-ALL_FEATURES = NUMERIC_FEATURES + BINARY_FEATURES
+ALL_FEATURES = NUMERIC_FEATURES + BINARY_FEATURES   # 18 numeric + 7 binary = 25
+
+
+# ─────────────────────────────────────────────
+#  LIGHTGBM HYPERPARAMETERS
+#  Conservative defaults tuned for tabular financial data
+#  (~50k rows, weak feature signal, regime-shifty labels).
+#  Strong regularization to combat overfitting on noise.
+# ─────────────────────────────────────────────
+LGBM_PARAMS = dict(
+    objective         = "binary",
+    n_estimators      = 300,
+    learning_rate     = 0.05,
+    num_leaves        = 31,         # ~2^5 splits per tree
+    max_depth         = -1,         # let num_leaves cap complexity
+    min_child_samples = 50,         # large minimum for noisy data
+    min_split_gain    = 0.01,       # avoid splits with no real gain
+    reg_alpha         = 0.1,        # L1
+    reg_lambda        = 0.1,        # L2
+    subsample         = 0.8,        # row sub-sampling
+    subsample_freq    = 1,          # required for subsample to take effect
+    colsample_bytree  = 0.8,        # feature sub-sampling
+    random_state      = 42,
+    n_jobs            = -1,
+    verbose           = -1,
+)
 
 
 # ─────────────────────────────────────────────
@@ -119,12 +164,18 @@ def prepare_xy(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
     for col in ALL_FEATURES:
         if col not in X.columns:
             X[col] = 0
-    # Coerce bools and fill numeric NaNs with median (per-column)
+    # Coerce bools and fill numeric NaNs with median (per-column).
+    # NaN in numeric features is common (e.g. vix_level for very old rows
+    # where the historical VIX backfill didn't yet exist, or risk_pct
+    # when v7's dynamic_trade_levels couldn't compute a level).
     for col in BINARY_FEATURES:
-        X[col] = X[col].astype(int)
+        X[col] = X[col].fillna(0).astype(int)
     for col in NUMERIC_FEATURES:
         X[col] = pd.to_numeric(X[col], errors="coerce")
-        X[col] = X[col].fillna(X[col].median())
+        med = X[col].median()
+        if pd.isna(med):
+            med = 0.0
+        X[col] = X[col].fillna(med)
     y = X["was_win"].astype(int)
     return X[ALL_FEATURES], y
 
@@ -134,13 +185,11 @@ def prepare_xy(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
 # ─────────────────────────────────────────────
 def train_model(df: pd.DataFrame, holdout_cutoff: str | None = None) -> dict:
     """
-    Train a calibrated LR. Returns a dict with the fitted pipeline,
-    the feature list, the validation metrics, and a fingerprint.
+    Train a calibrated LightGBM. Returns a dict with the fitted pipeline,
+    the feature list, validation metrics, feature importance, and a fingerprint.
     """
-    from sklearn.linear_model import LogisticRegression
-    from sklearn.preprocessing import StandardScaler
+    from lightgbm import LGBMClassifier
     from sklearn.calibration import CalibratedClassifierCV
-    from sklearn.pipeline import Pipeline
     from sklearn.metrics import roc_auc_score, log_loss, brier_score_loss
 
     # ── Walk-forward holdout split. If no cutoff provided, take last 20% of dates.
@@ -161,16 +210,29 @@ def train_model(df: pd.DataFrame, holdout_cutoff: str | None = None) -> dict:
     X_train, y_train = prepare_xy(df_train)
     X_test,  y_test  = prepare_xy(df_test)
 
-    base = LogisticRegression(max_iter=2000, C=1.0, class_weight=None)
+    # ── Diagnostic LightGBM (used for feature importance + raw AUC).
+    # We fit a separate LGBM here because CalibratedClassifierCV wraps the
+    # estimator inside a list of fold-fits, making feature importance
+    # extraction awkward. This costs an extra 10-15 sec but is worth it
+    # for the diagnostic.
+    diag = LGBMClassifier(**LGBM_PARAMS)
+    diag.fit(X_train, y_train)
+    p_test_raw = diag.predict_proba(X_test)[:, 1]
+    raw_auc    = roc_auc_score(y_test, p_test_raw)
+
+    importance = sorted(
+        zip(ALL_FEATURES, diag.feature_importances_),
+        key=lambda x: -x[1],
+    )
+
+    # ── Calibrated model: this is what we save and serve.
     cv_folds = min(5, max(2, len(df_train) // 200))
-    pipe = Pipeline([
-        ("scale", StandardScaler()),
-        ("clf",   CalibratedClassifierCV(estimator=base, cv=cv_folds, method="isotonic")),
-    ])
+    base = LGBMClassifier(**LGBM_PARAMS)
+    pipe = CalibratedClassifierCV(estimator=base, cv=cv_folds, method="isotonic")
     pipe.fit(X_train, y_train)
 
-    # ── Holdout metrics
-    p_test = pipe.predict_proba(X_test)[:, 1]
+    # ── Holdout metrics (on the calibrated model — what users actually see)
+    p_test    = pipe.predict_proba(X_test)[:, 1]
     auc       = roc_auc_score(y_test, p_test)
     ll        = log_loss(y_test, p_test, labels=[0, 1])
     brier     = brier_score_loss(y_test, p_test)
@@ -193,14 +255,19 @@ def train_model(df: pd.DataFrame, holdout_cutoff: str | None = None) -> dict:
     ).to_dict("index")
 
     metrics = {
-        "n_train":       int(len(df_train)),
-        "n_test":        int(len(df_test)),
-        "cutoff":        str(cutoff.date()),
-        "auc":           round(float(auc), 4),
-        "log_loss":      round(float(ll), 4),
-        "brier":         round(float(brier), 4),
-        "base_rate":     round(float(base_rate), 4),
-        "quartile_wr":   {str(k): v for k, v in quartile_wr.items()},
+        "model_kind":     "lightgbm_calibrated",
+        "n_train":        int(len(df_train)),
+        "n_test":         int(len(df_test)),
+        "cutoff":         str(cutoff.date()),
+        "auc":            round(float(auc), 4),
+        "auc_raw":        round(float(raw_auc), 4),     # uncalibrated reference
+        "log_loss":       round(float(ll), 4),
+        "brier":          round(float(brier), 4),
+        "base_rate":      round(float(base_rate), 4),
+        "quartile_wr":    {str(k): v for k, v in quartile_wr.items()},
+        "feature_importance_top10": [
+            {"feature": f, "importance": int(i)} for f, i in importance[:10]
+        ],
     }
 
     if auc < 0.55:
@@ -211,10 +278,11 @@ def train_model(df: pd.DataFrame, holdout_cutoff: str | None = None) -> dict:
 
     # Refit on the full dataset (train + test) for production deploy
     X_full, y_full = prepare_xy(df)
-    pipe_full = Pipeline([
-        ("scale", StandardScaler()),
-        ("clf",   CalibratedClassifierCV(estimator=base, cv=cv_folds, method="isotonic")),
-    ])
+    pipe_full = CalibratedClassifierCV(
+        estimator=LGBMClassifier(**LGBM_PARAMS),
+        cv=cv_folds,
+        method="isotonic",
+    )
     pipe_full.fit(X_full, y_full)
 
     blob = pickle.dumps({"pipeline": pipe_full, "features": ALL_FEATURES})
@@ -226,6 +294,7 @@ def train_model(df: pd.DataFrame, holdout_cutoff: str | None = None) -> dict:
         "blob":         blob,
         "fingerprint":  fingerprint,
         "metrics":      metrics,
+        "importance":   importance,    # full list, not just top 10
     }
 
 
@@ -247,7 +316,7 @@ def save_model(sb, trained: dict) -> None:
 
 
 # ─────────────────────────────────────────────
-#  PREDICTION (used by analyze.py)
+#  PREDICTION (used by analyze.py — UNCHANGED API)
 # ─────────────────────────────────────────────
 _model_cache = {"loaded": None}
 
@@ -288,6 +357,8 @@ def predict_p_win(pipeline, feats: list[str], signal_features: dict) -> float:
     """
     Return P(win) for one signal. signal_features is a dict that must contain
     all keys in `feats`. Missing keys default to 0; unexpected keys are ignored.
+    Works for both Phase 2 (LR) and Phase 3 (LGBM) models — predict_proba is
+    stable across both.
     """
     row = {f: signal_features.get(f, 0) for f in feats}
     X = pd.DataFrame([row])
@@ -314,7 +385,7 @@ def main():
                     help="Train and report, but don't write model to Supabase")
     args = ap.parse_args()
 
-    print("\n📈 Phase 2 — Calibrated LR scoring model")
+    print("\n📈 Phase 3 — Calibrated LightGBM scoring model")
     print(f"   Loading training data from Supabase...")
     sb = get_supabase()
     df = load_training_data(sb)
@@ -325,21 +396,28 @@ def main():
     print(f"   Date span        : {(df.signal_date.max() - df.signal_date.min()).days} days")
     print(f"   Tickers covered  : {df.ticker.nunique()}")
     print(f"   Regime mix       : {dict(df.regime.value_counts())}")
+    if "vix_level" in df.columns:
+        n_vix = df.vix_level.notna().sum()
+        print(f"   Rows w/ VIX data : {n_vix}/{len(df)} ({n_vix*100//len(df)}%)")
     print()
 
-    print("   Training calibrated LR...")
+    print("   Training calibrated LightGBM...")
     trained = train_model(df, holdout_cutoff=args.cutoff)
     m = trained["metrics"]
     print(f"\n   ── Holdout metrics ──")
     print(f"      Train rows           : {m['n_train']}")
     print(f"      Holdout rows         : {m['n_test']}  (after {m['cutoff']})")
     print(f"      Base rate            : {m['base_rate']*100:.1f}%")
-    print(f"      AUC                  : {m['auc']:.3f}")
+    print(f"      AUC (calibrated)     : {m['auc']:.3f}")
+    print(f"      AUC (raw LGBM)       : {m['auc_raw']:.3f}")
     print(f"      Log-loss             : {m['log_loss']:.3f}")
     print(f"      Brier score          : {m['brier']:.3f}")
     print(f"      Quartile WR (sorted by predicted P):")
     for q, vals in m["quartile_wr"].items():
         print(f"        {q}:  n={vals['n']:>4}  WR={vals['wr']:>5.1f}%  mean_p={vals['mean_p']}")
+    print(f"\n   ── Top features by gain importance ──")
+    for entry in m["feature_importance_top10"]:
+        print(f"      {entry['feature']:<22}  {entry['importance']}")
     print(f"\n   Fingerprint           : {trained['fingerprint']}")
 
     if args.no_save:
