@@ -408,8 +408,32 @@ def train_model(df: pd.DataFrame,
 
 
 def save_model(sb, trained: dict) -> None:
-    """Persist the model + metrics to score_models table."""
+    """Persist the model + metrics to score_models table.
+
+    Order matters: the schema has a partial unique index
+    `uniq_score_models_one_champion ON status WHERE status='champion'`
+    which rejects two-champion-rows-at-once at INSERT time. So we
+    have to retire the existing champion FIRST, then insert the
+    new one. (The reverse order — insert then update — fails with
+    duplicate-key error because PostgreSQL evaluates the unique
+    constraint immediately on insert.)
+    """
     import base64
+
+    # Step 1: demote any existing champions to 'retired'.
+    # Use a where-clause that won't ever match the about-to-be-inserted
+    # row (no fingerprint exists yet for it, but neq is a defensive
+    # guard against any edge case where the same fingerprint already
+    # exists — a re-train of the exact same data).
+    try:
+        sb.table("score_models").update({"status": "retired"}).eq(
+            "status", "champion"
+        ).neq("fingerprint", trained["fingerprint"]).execute()
+    except Exception as e:
+        print(f"  ⚠️  Failed to retire prior champion(s): {e}")
+        raise
+
+    # Step 2: insert the new champion. Now safe — no row has status='champion'.
     sb.table("score_models").insert({
         "fingerprint":   trained["fingerprint"],
         "trained_at":    datetime.utcnow().isoformat(),
@@ -418,10 +442,6 @@ def save_model(sb, trained: dict) -> None:
         "feature_list":  trained["features"],
         "status":        "champion",
     }).execute()
-    # Demote any older champions
-    sb.table("score_models").update({"status": "retired"}).neq(
-        "fingerprint", trained["fingerprint"]
-    ).eq("status", "champion").execute()
 
 
 # ─────────────────────────────────────────────
