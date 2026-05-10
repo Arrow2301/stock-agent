@@ -271,10 +271,18 @@ def train_model(df: pd.DataFrame, holdout_cutoff: str | None = None) -> dict:
     }
 
     if auc < 0.55:
-        raise RuntimeError(
-            f"Holdout AUC {auc:.3f} < 0.55 — model fails to beat random. "
-            "Aborting save. Check feature engineering or training-data quality."
-        )
+        # Failed gate. Skip the expensive full-data refit; main() will print
+        # metrics + feature importance and abort without saving. The existing
+        # champion model stays untouched.
+        return {
+            "pipeline":     None,
+            "features":     ALL_FEATURES,
+            "blob":         b"",
+            "fingerprint":  "",
+            "metrics":      metrics,
+            "importance":   importance,
+            "passed_gate":  False,
+        }
 
     # Refit on the full dataset (train + test) for production deploy
     X_full, y_full = prepare_xy(df)
@@ -295,6 +303,7 @@ def train_model(df: pd.DataFrame, holdout_cutoff: str | None = None) -> dict:
         "fingerprint":  fingerprint,
         "metrics":      metrics,
         "importance":   importance,    # full list, not just top 10
+        "passed_gate":  True,
     }
 
 
@@ -418,6 +427,12 @@ def main():
     print(f"\n   ── Top features by gain importance ──")
     for entry in m["feature_importance_top10"]:
         print(f"      {entry['feature']:<22}  {entry['importance']}")
+
+    if not trained["passed_gate"]:
+        print(f"\n   ❌ AUC {m['auc']:.3f} < 0.55 — failed gate.")
+        print(f"      Aborting save. Existing champion remains active.")
+        sys.exit(1)
+
     print(f"\n   Fingerprint           : {trained['fingerprint']}")
 
     if args.no_save:
