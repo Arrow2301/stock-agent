@@ -1,5 +1,98 @@
 # Changelog — v8 cleanup
 
+## v8.1 — synthetic-data generator post-mortem fixes
+
+A user-reported audit of `synthetic_training_data` revealed four bugs in
+the pre-v8 generator (`build_training_data.py`) that silently invalidated
+any model trained on that dataset. All four are fixed in v8.1, with a
+self-check harness that makes them structurally impossible to reintroduce:
+
+### Bugs fixed
+
+1. **Regime-label mismatch.** The pre-v8 generator labelled `regime` using
+   SMA50/SMA200 cross. The live agent uses EMA20/EMA50 + RSI. The model's
+   `regime_score` weight was therefore learned on a feature that didn't
+   exist at prediction time. **Fix:** extracted `regime_from_close_series()`
+   into `analyze.py` as a pure function; both modules import it. The
+   self-check verifies they're the same function object.
+
+2. **Entry-price look-ahead.** The pre-v8 `simulate_forward()` used
+   `signal_day Close` as the entry price. The live agent enters at
+   `signal_day+1 Open`. NSE overnight gaps average ~0.4% (occasionally
+   2%+), so labels were biased relative to production execution.
+   **Fix:** `simulate_forward()` now enters at next-bar open. Records the
+   `gap_pct` for diagnostic purposes. Handles the edge case where the gap
+   already breaches the SL on the entry bar's open (`exit_reason = 'gap_stop_at_open'`).
+
+3. **VIX dual implementation.** Two different code paths computed nominally
+   the same VIX features. Easy place for silent drift over time.
+   **Fix:** extracted `vix_features_from_series()` into `analyze.py`; both
+   modules import it.
+
+4. **Missing MFE bar number.** The pre-v8 generator stored `mfe` and `mae`
+   as scalars but discarded the bar number where each was reached. This
+   prevented research on trailing-stop rules like "trail SL once MFE > 5%
+   was reached at bar X". **Fix:** records `mfe_bar` and `mae_bar`.
+
+### New columns in `synthetic_training_data`
+
+`signal_close`, `entry_price`, `sl_price`, `target_price`, `gap_pct`,
+`mfe_bar`, `mae_bar`, `rr_floor_applied`, `data_quality_flags`.
+
+### Data-quality flags
+
+The new generator tags noisy rows with a CSV of flags:
+- `borderline_timeout` — return within ±1%, label is essentially noise
+- `gap_stop` — instant stop on gap-down at entry open
+- `very_low_vol` — ATR < 1%, ATR-based SL is unreliable
+- `large_gap` — |signal-to-open gap| > 2%
+
+`load_training_data()` in `score_model.py` now excludes these by default
+during training (configurable via the `exclude_quality_flags` argument).
+
+### Module-level changes
+
+- **`analyze.py`**: Supabase client init is now lazy. The module is
+  importable without `SUPABASE_URL`/`SUPABASE_KEY` set, which means it can
+  be imported by tests. `run()` fails fast with a clear error if the
+  client wasn't created.
+- **`build_training_data.py`**: full rewrite. New `--self-check` flag runs
+  4 structural correctness tests (none of which require Yahoo or
+  Supabase access).
+- **`score_model.py`**: `load_training_data()` accepts an
+  `exclude_quality_flags` parameter for filtering noisy rows.
+- **`supabase_setup.sql`**: canonical schema includes all v8.1 columns.
+- **`supabase_migrations/002_v8_training_data.sql`**: idempotent migration
+  that adds the new columns to existing deployments.
+
+### Migration path
+
+For users who have a populated `synthetic_training_data` table from before
+v8.1, the recommended path is:
+
+1. Run `supabase_migrations/002_v8_training_data.sql` in Supabase SQL Editor.
+2. `python agent/build_training_data.py --purge` to wipe and regenerate
+   with corrected logic.
+3. `python -m agent.score_model` to retrain on the clean dataset.
+
+The `--purge` step is necessary because the pre-v8 rows have a different
+`regime` definition and entry-price semantics than the new ones; mixing
+them would produce a model trained on inconsistent feature distributions.
+
+### What this means for production
+
+Models trained on the pre-v8 dataset should be considered untrustworthy.
+The old generator's biases produced inverted relationships in some
+features (e.g. `rr_ratio` had Pearson correlation **-0.14** with `was_win`
+in the old data — opposite of intuition — driven by the MIN_RR_RATIO
+floor stretching targets on tight-SL setups, which were then dominated by
+stop-outs). These inverted relationships are mathematical artifacts of
+the generator, not market truths. They will go away with v8.1's data.
+
+---
+
+## v8.0 — initial cleanup
+
 This release is a senior-engineer / senior-quant pass over the v7 +
 Phase 3 codebase. The goal was: reduce surface area, fix real
 bugs, and add the missing risk primitives — without changing the

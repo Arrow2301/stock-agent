@@ -124,10 +124,21 @@ def get_supabase():
     return create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
 
 
-def load_training_data(sb, min_rows: int = 500) -> pd.DataFrame:
+def load_training_data(sb, min_rows: int = 500,
+                       exclude_quality_flags: tuple[str, ...] = (
+                           "borderline_timeout", "gap_stop", "very_low_vol",
+                       )) -> pd.DataFrame:
     """
     Load all rows from synthetic_training_data. Paginates Supabase's
     1000-row default limit. Returns a clean DataFrame.
+
+    `exclude_quality_flags` filters out rows whose `data_quality_flags`
+    column (added in v8 generator) contains ANY of the listed flags.
+    Defaults exclude the three known-noisy buckets:
+      * borderline_timeout — return within ±1%, label ≈ random coin flip
+      * gap_stop           — instant stop on gap-down at entry open
+      * very_low_vol       — ATR < 1%, ATR-based SL is unreliable
+    Pass an empty tuple to disable filtering and include everything.
     """
     rows: list[dict] = []
     page = 0
@@ -146,7 +157,7 @@ def load_training_data(sb, min_rows: int = 500) -> pd.DataFrame:
         if len(r.data) < page_size:
             break
         page += 1
-        if page > 100:                 # guard: cap at 100k rows
+        if page > 100:
             break
     if len(rows) < min_rows:
         raise RuntimeError(
@@ -155,6 +166,18 @@ def load_training_data(sb, min_rows: int = 500) -> pd.DataFrame:
         )
     df = pd.DataFrame(rows)
     df["signal_date"] = pd.to_datetime(df["signal_date"])
+
+    # Quality filter (only if column exists — old datasets won't have it)
+    if exclude_quality_flags and "data_quality_flags" in df.columns:
+        flags = df["data_quality_flags"].fillna("").astype(str)
+        excl = pd.Series(False, index=df.index)
+        for f in exclude_quality_flags:
+            excl |= flags.str.contains(f, na=False)
+        before = len(df)
+        df = df[~excl].reset_index(drop=True)
+        print(f"   Filtered {before - len(df)} rows by quality flags "
+              f"({', '.join(exclude_quality_flags)})")
+
     return df
 
 

@@ -375,6 +375,12 @@ CREATE TABLE IF NOT EXISTS synthetic_training_data (
     signal_date         DATE        NOT NULL,
     ticker              TEXT        NOT NULL,
 
+    -- Setup snapshot (signal-day close + computed levels)
+    signal_close        NUMERIC,
+    sl_price            NUMERIC,
+    target_price        NUMERIC,
+    rr_floor_applied    BOOLEAN,
+
     -- Numeric features (must match score_model.NUMERIC_FEATURES)
     rsi                 NUMERIC,
     macd_hist           NUMERIC,
@@ -406,11 +412,24 @@ CREATE TABLE IF NOT EXISTS synthetic_training_data (
 
     -- Context columns (informational, not features)
     regime              TEXT,
+    gated_out           BOOLEAN,
+
+    -- Trade execution outcome (label-side; v8 enters at NEXT-bar OPEN)
     entry_price         NUMERIC,
     exit_price          NUMERIC,
     actual_return_pct   NUMERIC,
     days_held           INTEGER,
     exit_reason         TEXT,
+    gap_pct             NUMERIC,    -- signal-close → entry-open gap %
+
+    -- MFE / MAE for trailing-stop research
+    mfe                 NUMERIC,
+    mae                 NUMERIC,
+    mfe_bar             INTEGER,
+    mae_bar             INTEGER,
+
+    -- Data quality (CSV of flags: borderline_timeout, gap_stop, etc.)
+    data_quality_flags  TEXT,
 
     -- Label
     was_win             BOOLEAN     NOT NULL,

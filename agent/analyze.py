@@ -57,10 +57,21 @@ warnings.filterwarnings("ignore")
 
 # ─────────────────────────────────────────────
 #  SUPABASE
+#
+#  We tolerate a missing or invalid client at IMPORT TIME so this
+#  module can be imported by the self-check harness, by build_training_data
+#  in --self-check mode, and by unit tests. run() will fail fast if the
+#  client wasn't successfully created.
 # ─────────────────────────────────────────────
-SUPABASE_URL = os.environ["SUPABASE_URL"]
-SUPABASE_KEY = os.environ["SUPABASE_KEY"]
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+supabase: Client | None = None
+if SUPABASE_URL and SUPABASE_KEY:
+    try:
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+    except Exception as _e:
+        # Print but don't crash — the caller may be importing for testing.
+        print(f"  ⚠️  Supabase client init deferred: {_e}")
 
 # Capital base for the suggested-qty computation. Defaults to ₹100,000.
 DEFAULT_ACCOUNT_INR = float(os.environ.get("ACCOUNT_INR", "100000"))
@@ -994,38 +1005,55 @@ def momentum_vs_nifty_30d(df, benchmark_df, days: int = 30):
         return None
 
 
+_VIX_NONE = {"vix_level": None, "vix_change_5d": None, "vix_zscore_60d": None}
+
+
+def vix_features_from_series(close_series: pd.Series) -> dict:
+    """Pure VIX feature computation. Used by both the live agent
+    (passing the last 6 months of ^INDIAVIX) and the synthetic
+    generator (passing all VIX history sliced to the as-of date).
+    Single source of truth — eliminates the v7 risk that the two
+    code paths silently diverge.
+    """
+    if close_series is None or len(close_series) == 0:
+        return dict(_VIX_NONE)
+    series = close_series.dropna()
+    if series.empty:
+        return dict(_VIX_NONE)
+    level = float(series.iloc[-1])
+    if not math.isfinite(level):
+        return dict(_VIX_NONE)
+    change_5d = None
+    if len(series) >= 6:
+        prev = float(series.iloc[-6])
+        if math.isfinite(prev):
+            change_5d = round(level - prev, 3)
+    zscore_60d = None
+    if len(series) >= 60:
+        window = series.iloc[-60:]
+        mu = float(window.mean())
+        sd = float(window.std(ddof=0))
+        if sd > 1e-9 and math.isfinite(mu) and math.isfinite(sd):
+            zscore_60d = round((level - mu) / sd, 3)
+    return {"vix_level":      round(level, 3),
+            "vix_change_5d":  change_5d,
+            "vix_zscore_60d": zscore_60d}
+
+
 def fetch_vix_features_today() -> dict:
-    none_out = {"vix_level": None, "vix_change_5d": None, "vix_zscore_60d": None}
+    """Live-agent wrapper: fetch ^INDIAVIX last 6 months and compute features."""
     try:
         df = yf.download("^INDIAVIX", period="6mo",
                          progress=False, auto_adjust=True, threads=False)
         if df is None or df.empty:
-            return none_out
+            return dict(_VIX_NONE)
         df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
-        series = df["Close"].dropna()
-        if series.empty:
-            return none_out
-        level = float(series.iloc[-1])
-        if not math.isfinite(level):
-            return none_out
-        change_5d = None
-        if len(series) >= 6:
-            prev = float(series.iloc[-6])
-            if math.isfinite(prev):
-                change_5d = round(level - prev, 3)
-        zscore_60d = None
-        if len(series) >= 60:
-            window = series.iloc[-60:]
-            mu = float(window.mean())
-            sd = float(window.std(ddof=0))
-            if sd > 1e-9 and math.isfinite(mu) and math.isfinite(sd):
-                zscore_60d = round((level - mu) / sd, 3)
-        return {"vix_level":      round(level, 3),
-                "vix_change_5d":  change_5d,
-                "vix_zscore_60d": zscore_60d}
+        if "Close" not in df.columns:
+            return dict(_VIX_NONE)
+        return vix_features_from_series(df["Close"].dropna())
     except Exception as e:
         print(f"  ⚠️  VIX fetch failed: {e}")
-        return none_out
+        return dict(_VIX_NONE)
 
 
 def signal_features_for_model(ctx, today_sigs, regime_label,
@@ -1071,24 +1099,57 @@ def signal_features_for_model(ctx, today_sigs, regime_label,
 
 # ─────────────────────────────────────────────
 #  MARKET REGIME
+#
+#  This is the SINGLE SOURCE OF TRUTH for regime classification.
+#  Both the live agent and the synthetic-data generator
+#  (agent/build_training_data.py) must call regime_from_close_series()
+#  so labels match exactly. Splitting fetch from logic prevents the
+#  silent feature mismatch that v7 had — production used EMA20/50+RSI,
+#  but the synthetic generator was using SMA50/200, so the model's
+#  `regime_score` weight was learned on a feature it would never see.
 # ─────────────────────────────────────────────
+def regime_from_close_series(close: pd.Series, p: dict | None = None
+                             ) -> tuple[str, float]:
+    """Classify regime from a Nifty (or other index) close-price series.
+
+    Pure function. No I/O. Uses ONLY data ≤ the last index of `close` —
+    safe to call point-in-time during synthetic-data generation by passing
+    the slice up to (and including) the as-of date.
+
+    Returns (label, score) where score is in {0.0, 0.5, 1.0}.
+    """
+    if p is None:
+        p = DEFAULT_PARAMS
+    if close is None or len(close) < 55:
+        return "UNKNOWN", 0.5
+    try:
+        c = close.dropna()
+        if len(c) < 55:
+            return "UNKNOWN", 0.5
+        e50   = float(ema(c, 50).iloc[-1])
+        e20   = float(ema(c, 20).iloc[-1])
+        r     = float(rsi(c, int(p.get("RSI_PERIOD", 14))).iloc[-1])
+        price = float(c.iloc[-1])
+        if not all(math.isfinite(x) for x in (e50, e20, r, price)):
+            return "UNKNOWN", 0.5
+        if price > e20 > e50 and r > 50: return "BULLISH", 1.0
+        if price < e20 < e50 and r < 50: return "BEARISH", 0.0
+        return "NEUTRAL", 0.5
+    except Exception:
+        return "UNKNOWN", 0.5
+
+
 def market_regime(p: dict) -> tuple[str, float]:
+    """Live-agent wrapper: fetch Nifty's last 120 days and classify."""
     try:
         df = yf.download("^NSEI", period="120d",
                          progress=False, auto_adjust=True)
-        if df.empty or len(df) < 55:
+        if df.empty:
             return "UNKNOWN", 0.5
         df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
         if "Close" not in df.columns:
             return "UNKNOWN", 0.5
-        close = df["Close"].squeeze()
-        e50   = float(ema(close, 50).iloc[-1])
-        e20   = float(ema(close, 20).iloc[-1])
-        r     = float(rsi(close, p["RSI_PERIOD"]).iloc[-1])
-        price = float(close.iloc[-1])
-        if price > e20 > e50 and r > 50: return "BULLISH", 1.0
-        if price < e20 < e50 and r < 50: return "BEARISH", 0.0
-        return "NEUTRAL", 0.5
+        return regime_from_close_series(df["Close"].squeeze(), p)
     except Exception:
         return "UNKNOWN", 0.5
 
@@ -1096,6 +1157,11 @@ def market_regime(p: dict) -> tuple[str, float]:
 #  MAIN
 # ─────────────────────────────────────────────
 def run():
+    if supabase is None:
+        raise RuntimeError(
+            "Supabase client not initialized. SUPABASE_URL and SUPABASE_KEY "
+            "must be set to valid values before running the agent."
+        )
     today = datetime.today().strftime("%Y-%m-%d")
     print(f"\n🇮🇳 Indian Stock Agent v8 — {today}")
 
