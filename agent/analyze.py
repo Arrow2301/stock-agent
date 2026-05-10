@@ -48,7 +48,7 @@ from portfolio import open_tickers, open_positions_with_sector, recent_closed_pn
 
 try:
     from score_model import load_model, predict_p_win
-    _SCORE_MODEL = load_model()           # (pipeline, feature_list) or None
+    _SCORE_MODEL = load_model()           # (pipeline, features, label_kind) or None
 except Exception as _score_err:
     print(f"  ⚠️  score_model unavailable: {_score_err}")
     _SCORE_MODEL = None
@@ -1294,13 +1294,15 @@ def run():
             # Phase 3 P(win)
             p_win_score = None
             if _SCORE_MODEL is not None and action == "BUY":
-                pipeline, feats = _SCORE_MODEL
+                pipeline, feats, _label_kind = _SCORE_MODEL
                 mom = momentum_vs_nifty_30d(df, benchmark_df)
                 sig_feats = signal_features_for_model(
                     ctx, today_sigs, regime_label, mom, vix_features
                 )
                 try:
-                    p_win_score = round(predict_p_win(pipeline, feats, sig_feats), 4)
+                    p_win_score = round(
+                        predict_p_win(pipeline, feats, sig_feats, label_kind=_label_kind), 4
+                    )
                 except Exception as e:
                     print(f"\n  ⚠️  predict_p_win failed for {ticker}: {e}")
             c_breakdown["p_win"] = p_win_score
